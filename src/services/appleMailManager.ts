@@ -103,6 +103,17 @@ const MAILBOX_ALIASES: Record<string, string[]> = {
   archive: ["Archive", "ARCHIVE", "archive", "All Mail"],
 };
 
+// Safe output delimiters — Unicode Private Use Area characters that cannot
+// appear in real email subjects, sender names, or mailbox names.
+// U+E001 = field separator (replaces pipe-pipe-pipe delimiter)
+// U+E002 = record separator (replaces pipe-pipe-pipe ITEM pipe-pipe-pipe delimiter)
+// U+E003 = content separator (replaces pipe-pipe-pipe CONTENT pipe-pipe-pipe in getMessageContent)
+// U+E004 = html separator (replaces pipe-pipe-pipe HTML pipe-pipe-pipe in getMessageContent)
+const FIELD_SEP = "";
+const RECORD_SEP = "";
+const CONTENT_SEP = "";
+const HTML_SEP = "";
+
 // =============================================================================
 // Apple Mail Manager Class
 // =============================================================================
@@ -336,6 +347,8 @@ export class AppleMailManager {
     }
 
     const searchCommand = `
+      set fieldSep to character id 57345
+      set recSep to character id 57346
       set outputText to ""
       set theMailbox to mailbox "${escapeForAppleScript(targetMailbox)}"
       set allMessages to messages of theMailbox ${searchCondition}
@@ -350,8 +363,8 @@ export class AppleMailManager {
           set msgDateStr to date received of msg as string
           set msgRead to read status of msg as string
           set msgFlagged to flagged status of msg as string
-          if msgCount > 0 then set outputText to outputText & "|||ITEM|||"
-          set outputText to outputText & msgId & "|||" & msgSubject & "|||" & msgSender & "|||" & msgDateStr & "|||" & msgRead & "|||" & msgFlagged
+          if msgCount > 0 then set outputText to outputText & recSep
+          set outputText to outputText & msgId & fieldSep & msgSubject & fieldSep & msgSender & fieldSep & msgDateStr & fieldSep & msgRead & fieldSep & msgFlagged
           set msgCount to msgCount + 1
           ${dateFilter ? "end if" : ""}
         end try
@@ -381,6 +394,7 @@ export class AppleMailManager {
   getMessageById(id: string): Message | null {
     const script = buildAppLevelScript(`
       try
+        set fieldSep to character id 57345
         repeat with acct in accounts
           repeat with mb in mailboxes of acct
             try
@@ -396,7 +410,7 @@ export class AppleMailManager {
                 set msgDeleted to deleted status of msg as string
                 set msgMailbox to name of mb
                 set msgAccount to name of acct
-                return msgSubject & "|||" & msgSender & "|||" & msgDate & "|||" & msgRead & "|||" & msgFlagged & "|||" & msgJunk & "|||" & msgDeleted & "|||" & msgMailbox & "|||" & msgAccount
+                return msgSubject & fieldSep & msgSender & fieldSep & msgDate & fieldSep & msgRead & fieldSep & msgFlagged & fieldSep & msgJunk & fieldSep & msgDeleted & fieldSep & msgMailbox & fieldSep & msgAccount
               end if
             end try
           end repeat
@@ -414,7 +428,7 @@ export class AppleMailManager {
       return null;
     }
 
-    const parts = result.output.split("|||");
+    const parts = result.output.split(FIELD_SEP);
     if (parts.length < 9) return null;
 
     return {
@@ -439,6 +453,8 @@ export class AppleMailManager {
   getMessageContent(id: string): MessageContent | null {
     const script = buildAppLevelScript(`
       try
+        set contentSep to character id 57347
+        set htmlSep to character id 57348
         repeat with acct in accounts
           repeat with mb in mailboxes of acct
             try
@@ -451,7 +467,7 @@ export class AppleMailManager {
                 try
                   set htmlContent to source of msg
                 end try
-                return msgSubject & "|||CONTENT|||" & msgContent & "|||HTML|||" & htmlContent
+                return msgSubject & contentSep & msgContent & htmlSep & htmlContent
               end if
             end try
           end repeat
@@ -469,11 +485,11 @@ export class AppleMailManager {
       return null;
     }
 
-    const htmlSplit = result.output.split("|||HTML|||");
+    const htmlSplit = result.output.split(HTML_SEP);
     const contentPart = htmlSplit[0];
     const htmlContent = htmlSplit.length > 1 ? htmlSplit[1] : undefined;
 
-    const parts = contentPart.split("|||CONTENT|||");
+    const parts = contentPart.split(CONTENT_SEP);
     if (parts.length < 2) return null;
 
     return {
@@ -507,6 +523,8 @@ export class AppleMailManager {
     const fromFilter = from ? `whose sender contains "${safeFrom}"` : "";
 
     const listCommand = `
+      set fieldSep to character id 57345
+      set recSep to character id 57346
       set outputText to ""
       set theMailbox to mailbox "${escapeForAppleScript(targetMailbox)}"
       set msgCount to 0
@@ -523,8 +541,8 @@ export class AppleMailManager {
             set msgDate to date received of msg as string
             set msgRead to read status of msg as string
             set msgFlagged to flagged status of msg as string
-            if msgCount > 0 then set outputText to outputText & "|||ITEM|||"
-            set outputText to outputText & msgId & "|||" & msgSubject & "|||" & msgSender & "|||" & msgDate & "|||" & msgRead & "|||" & msgFlagged
+            if msgCount > 0 then set outputText to outputText & recSep
+            set outputText to outputText & msgId & fieldSep & msgSubject & fieldSep & msgSender & fieldSep & msgDate & fieldSep & msgRead & fieldSep & msgFlagged
             set msgCount to msgCount + 1
           end if
         end try
@@ -549,11 +567,11 @@ export class AppleMailManager {
    * Parse message list output from AppleScript.
    */
   private parseMessageList(output: string, mailbox: string, account: string): Message[] {
-    const items = output.split("|||ITEM|||");
+    const items = output.split(RECORD_SEP);
     const messages: Message[] = [];
 
     for (const item of items) {
-      const parts = item.split("|||");
+      const parts = item.split(FIELD_SEP);
       if (parts.length < 6) continue;
 
       messages.push({
@@ -1085,6 +1103,8 @@ export class AppleMailManager {
   listAttachments(id: string): Attachment[] {
     const script = buildAppLevelScript(`
       try
+        set fieldSep to character id 57345
+        set recSep to character id 57346
         repeat with acct in accounts
           repeat with mb in mailboxes of acct
             try
@@ -1097,8 +1117,8 @@ export class AppleMailManager {
                   set attName to name of att
                   set attType to MIME type of att
                   set attSize to file size of att as string
-                  if attCount > 0 then set outputText to outputText & "|||ITEM|||"
-                  set outputText to outputText & attName & "|||" & attType & "|||" & attSize
+                  if attCount > 0 then set outputText to outputText & recSep
+                  set outputText to outputText & attName & fieldSep & attType & fieldSep & attSize
                   set attCount to attCount + 1
                 end repeat
                 return outputText
@@ -1118,11 +1138,11 @@ export class AppleMailManager {
       return [];
     }
 
-    const items = result.output.split("|||ITEM|||");
+    const items = result.output.split(RECORD_SEP);
     const attachments: Attachment[] = [];
 
     for (const item of items) {
-      const parts = item.split("|||");
+      const parts = item.split(FIELD_SEP);
       if (parts.length < 3) continue;
 
       attachments.push({
@@ -1195,9 +1215,9 @@ export class AppleMailManager {
         set mbName to name of mb
         set mbUnread to unread count of mb
         set mbCount to count of messages of mb
-        set end of mailboxList to mbName & "|||" & mbUnread & "|||" & mbCount
+        set end of mailboxList to mbName & (character id 57345) & mbUnread & (character id 57345) & mbCount
       end repeat
-      set AppleScript's text item delimiters to "|||ITEM|||"
+      set AppleScript's text item delimiters to (character id 57346)
       return mailboxList as text
     `;
 
@@ -1211,11 +1231,11 @@ export class AppleMailManager {
 
     if (!result.output.trim()) return [];
 
-    const items = result.output.split("|||ITEM|||");
+    const items = result.output.split(RECORD_SEP);
     const mailboxes: Mailbox[] = [];
 
     for (const item of items) {
-      const parts = item.split("|||");
+      const parts = item.split(FIELD_SEP);
       if (parts.length < 3) continue;
 
       mailboxes.push({
@@ -1388,9 +1408,9 @@ export class AppleMailManager {
         if (count of acctEmail) > 0 then
           set emailStr to item 1 of acctEmail
         end if
-        set end of accountList to acctName & "|||" & emailStr & "|||" & acctEnabled
+        set end of accountList to acctName & (character id 57345) & emailStr & (character id 57345) & acctEnabled
       end repeat
-      set AppleScript's text item delimiters to "|||ITEM|||"
+      set AppleScript's text item delimiters to (character id 57346)
       return accountList as text
     `);
 
@@ -1403,11 +1423,11 @@ export class AppleMailManager {
 
     if (!result.output.trim()) return [];
 
-    const items = result.output.split("|||ITEM|||");
+    const items = result.output.split(RECORD_SEP);
     const accounts: Account[] = [];
 
     for (const item of items) {
-      const parts = item.split("|||");
+      const parts = item.split(FIELD_SEP);
       if (parts.length < 3) continue;
 
       accounts.push({
@@ -1457,9 +1477,9 @@ export class AppleMailManager {
       repeat with r in rules
         set ruleName to name of r
         set ruleEnabled to enabled of r
-        set end of ruleList to ruleName & "|||" & (ruleEnabled as string)
+        set end of ruleList to ruleName & (character id 57345) & (ruleEnabled as string)
       end repeat
-      set AppleScript's text item delimiters to "|||ITEM|||"
+      set AppleScript's text item delimiters to (character id 57346)
       return ruleList as text
     `);
 
@@ -1469,11 +1489,11 @@ export class AppleMailManager {
       return [];
     }
 
-    const items = result.output.split("|||ITEM|||");
+    const items = result.output.split(RECORD_SEP);
     const rules: MailRule[] = [];
 
     for (const item of items) {
-      const parts = item.split("|||");
+      const parts = item.split(FIELD_SEP);
       if (parts.length < 2) continue;
       rules.push({
         name: parts[0],
@@ -1546,11 +1566,11 @@ export class AppleMailManager {
               if pPhones is not "" then set pPhones to pPhones & ","
               set pPhones to pPhones & (value of ph)
             end repeat
-            set end of matchedContacts to pName & "|||" & pEmails & "|||" & pPhones
+            set end of matchedContacts to pName & (character id 57345) & pEmails & (character id 57345) & pPhones
           end if
         end repeat
 
-        set AppleScript's text item delimiters to "|||ITEM|||"
+        set AppleScript's text item delimiters to (character id 57346)
         return matchedContacts as text
       end tell
     `;
@@ -1561,11 +1581,11 @@ export class AppleMailManager {
       return [];
     }
 
-    const items = result.output.split("|||ITEM|||");
+    const items = result.output.split(RECORD_SEP);
     const contacts: Contact[] = [];
 
     for (const item of items) {
-      const parts = item.split("|||");
+      const parts = item.split(FIELD_SEP);
       if (parts.length < 3) continue;
       contacts.push({
         name: parts[0],
@@ -1833,7 +1853,7 @@ export class AppleMailManager {
         end try
       end repeat
 
-      return (last24h as string) & "|||" & (last7d as string) & "|||" & (last30d as string)
+      return (last24h as string) & (character id 57345) & (last7d as string) & (character id 57345) & (last30d as string)
     `);
 
     const result = executeAppleScript(script, { timeoutMs: 60000 });
@@ -1843,7 +1863,7 @@ export class AppleMailManager {
       return { last24h: 0, last7d: 0, last30d: 0 };
     }
 
-    const parts = result.output.split("|||");
+    const parts = result.output.split(FIELD_SEP);
     if (parts.length < 3) {
       return { last24h: 0, last7d: 0, last30d: 0 };
     }
@@ -1889,7 +1909,7 @@ export class AppleMailManager {
         set totalMailboxes to totalMailboxes + (count of mailboxes of acct)
       end repeat
 
-      return "running|||" & accountCount & "|||" & totalMailboxes
+      return "running" & (character id 57345) & accountCount & (character id 57345) & totalMailboxes
     `);
 
     const result = executeAppleScript(script);
@@ -1915,7 +1935,7 @@ export class AppleMailManager {
     }
 
     // Parse the response
-    const parts = result.output.split("|||");
+    const parts = result.output.split(FIELD_SEP);
     const isRunning = parts[0] === "running";
     const accountCount = parseInt(parts[1]) || 0;
 
