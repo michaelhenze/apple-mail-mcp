@@ -75,6 +75,33 @@ export interface Message {
 }
 
 /**
+ * A message in an email thread, returned by get-thread.
+ * Subset of Message with fields sufficient for thread display.
+ */
+export interface ThreadMessage {
+  /** Unique identifier for the message */
+  id: string;
+
+  /** Subject line */
+  subject: string;
+
+  /** Sender email address */
+  sender: string;
+
+  /** Date received */
+  dateReceived: Date;
+
+  /** Whether the message has been read */
+  isRead: boolean;
+
+  /** Mailbox containing the message */
+  mailbox: string;
+
+  /** Account containing the message */
+  account: string;
+}
+
+/**
  * Represents the content of an email message.
  */
 export interface MessageContent {
@@ -473,21 +500,17 @@ export interface EmailTemplate {
 // =============================================================================
 
 /**
- * Status of Mail.app sync activity.
+ * Status of Mail.app — whether it is running and how many accounts are loaded.
+ * Note: Apple Mail's AppleScript API does not expose IMAP sync state, pending
+ * upload counts, or last-sync timestamps. Only observable facts are reported.
  */
 export interface SyncStatus {
-  /** Whether sync activity was detected */
-  syncDetected: boolean;
+  /** Whether Mail.app is currently running */
+  running: boolean;
 
-  /** Number of items pending upload */
-  pendingUpload: number;
+  /** Number of accounts loaded in Mail.app */
+  accountCount: number;
 
-  /** Whether there was recent database activity */
-  recentActivity: boolean;
-
-  /** Seconds since last database change */
-  secondsSinceLastChange: number;
-
-  /** Error message if status check failed */
+  /** Error message if the status check failed */
   error?: string;
 }
