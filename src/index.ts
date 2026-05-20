@@ -109,9 +109,26 @@ server.tool(
     dateFrom: z.string().optional().describe("Start date filter (e.g., 'January 1, 2026')"),
     dateTo: z.string().optional().describe("End date filter (e.g., 'March 1, 2026')"),
     limit: z.number().optional().describe("Maximum number of results (default: 50)"),
+    allMailboxes: z
+      .boolean()
+      .optional()
+      .describe(
+        "Search across all mailboxes in the account (not just INBOX). May be slow on large mail stores."
+      ),
   },
   withErrorHandling(
-    ({ query, from, isRead, isFlagged, mailbox, account, limit = 50, dateFrom, dateTo }) => {
+    ({
+      query,
+      from,
+      isRead,
+      isFlagged,
+      mailbox,
+      account,
+      limit = 50,
+      dateFrom,
+      dateTo,
+      allMailboxes,
+    }) => {
       const messages = mailManager.searchMessages(
         query,
         mailbox,
@@ -121,7 +138,8 @@ server.tool(
         dateTo,
         from,
         isRead,
-        isFlagged
+        isFlagged,
+        allMailboxes
       );
 
       if (messages.length === 0) {

@@ -311,7 +311,8 @@ export class AppleMailManager {
     dateTo?: string,
     from?: string,
     isRead?: boolean,
-    isFlagged?: boolean
+    isFlagged?: boolean,
+    allMailboxes?: boolean
   ): Message[] {
     // If no account specified, search across all accounts
     if (!account) {
@@ -329,7 +330,8 @@ export class AppleMailManager {
           dateTo,
           from,
           isRead,
-          isFlagged
+          isFlagged,
+          allMailboxes
         );
         allMessages.push(...msgs);
       }
@@ -337,8 +339,6 @@ export class AppleMailManager {
     }
 
     const targetAccount = this.resolveAccount(account);
-    const requestedMailbox = mailbox || "INBOX";
-    const targetMailbox = this.resolveMailbox(requestedMailbox, targetAccount);
 
     // Build compound search conditions
     const searchConditions: string[] = [];
@@ -373,6 +373,44 @@ export class AppleMailManager {
       }
       dateFilter = dateChecks.join(" and ");
     }
+
+    if (allMailboxes) {
+      const searchCommand = `
+        set fieldSep to character id 57345
+        set recSep to character id 57346
+        set outputText to ""
+        set msgCount to 0
+        repeat with mb in mailboxes
+          set allMsgs to messages of mb ${searchCondition}
+          repeat with msg in allMsgs
+            if msgCount >= ${limit} then exit repeat
+            try
+              ${dateFilter ? `set msgDate to date received of msg\n              if not (${dateFilter}) then\n              else` : ""}
+              set msgId to id of msg as string
+              set msgSubject to subject of msg
+              set msgSender to sender of msg
+              set msgDateStr to date received of msg as string
+              set msgRead to read status of msg as string
+              set msgFlagged to flagged status of msg as string
+              set mbName to name of mb
+              if msgCount > 0 then set outputText to outputText & recSep
+              set outputText to outputText & msgId & fieldSep & msgSubject & fieldSep & msgSender & fieldSep & msgDateStr & fieldSep & msgRead & fieldSep & msgFlagged & fieldSep & mbName
+              set msgCount to msgCount + 1
+              ${dateFilter ? "end if" : ""}
+            end try
+          end repeat
+          if msgCount >= ${limit} then exit repeat
+        end repeat
+        return outputText
+      `;
+      const script = buildAccountScopedScript(targetAccount, searchCommand);
+      const result = executeAppleScript(script, { timeoutMs: 60000 });
+      if (!result.success || !result.output.trim()) return [];
+      return this.parseMessageListAllMailboxes(result.output, targetAccount);
+    }
+
+    const requestedMailbox = mailbox || "INBOX";
+    const targetMailbox = this.resolveMailbox(requestedMailbox, targetAccount);
 
     const searchCommand = `
       set fieldSep to character id 57345
@@ -667,6 +705,37 @@ export class AppleMailManager {
         isJunk: false,
         isDeleted: false,
         mailbox,
+        account,
+        hasAttachments: false,
+      });
+    }
+
+    return messages;
+  }
+
+  /**
+   * Parse message list from allMailboxes search output.
+   * Each record has 7 fields: id, subject, sender, date, read, flagged, mailbox
+   */
+  private parseMessageListAllMailboxes(output: string, account: string): Message[] {
+    const items = output.split(RECORD_SEP);
+    const messages: Message[] = [];
+
+    for (const item of items) {
+      const parts = item.split(FIELD_SEP);
+      if (parts.length < 7) continue;
+
+      messages.push({
+        id: parts[0].trim(),
+        subject: parts[1],
+        sender: parts[2],
+        recipients: [],
+        dateReceived: parseAppleScriptDate(parts[3]),
+        isRead: parts[4] === "true",
+        isFlagged: parts[5] === "true",
+        isJunk: false,
+        isDeleted: false,
+        mailbox: parts[6],
         account,
         hasAttachments: false,
       });
