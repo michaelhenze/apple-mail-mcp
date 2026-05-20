@@ -166,9 +166,17 @@ export function normalizeSubject(subject: string): string {
  */
 export class AppleMailManager {
   private readonly TEMPLATE_FILE = join(homedir(), ".config", "apple-mail-mcp", "templates.json");
+  private readonly CONFIG_FILE = join(homedir(), ".config", "apple-mail-mcp", "config.json");
+
+  private config: {
+    defaultAccount?: string;
+    defaultMailbox?: string;
+    timeoutMs?: number;
+  } = {};
 
   constructor() {
     this.loadTemplates();
+    this.loadConfig();
   }
 
   /**
@@ -2402,6 +2410,46 @@ export class AppleMailManager {
     } catch (err) {
       console.error(`[apple-mail-mcp] Failed to persist templates: ${err}`);
     }
+  }
+
+  private loadConfig(): void {
+    try {
+      if (!existsSync(this.CONFIG_FILE)) return;
+      const raw = readFileSync(this.CONFIG_FILE, "utf8");
+      this.config = JSON.parse(raw) as typeof this.config;
+      // Seed the TTL cache from config as a preference hint
+      if (this.config.defaultAccount) {
+        this.defaultAccountCache = {
+          value: this.config.defaultAccount,
+          expiresAt: Date.now() + this.DEFAULT_ACCOUNT_TTL_MS,
+        };
+      }
+    } catch (err) {
+      console.error(`[apple-mail-mcp] Failed to load config: ${err}`);
+    }
+  }
+
+  private persistConfig(): void {
+    try {
+      const dir = join(homedir(), ".config", "apple-mail-mcp");
+      if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+      writeFileSync(this.CONFIG_FILE, JSON.stringify(this.config, null, 2), "utf8");
+    } catch (err) {
+      console.error(`[apple-mail-mcp] Failed to persist config: ${err}`);
+    }
+  }
+
+  getConfig(): { defaultAccount?: string; defaultMailbox?: string; timeoutMs?: number } {
+    return { ...this.config };
+  }
+
+  setConfig(partial: {
+    defaultAccount?: string;
+    defaultMailbox?: string;
+    timeoutMs?: number;
+  }): void {
+    this.config = { ...this.config, ...partial };
+    this.persistConfig();
   }
 
   /**

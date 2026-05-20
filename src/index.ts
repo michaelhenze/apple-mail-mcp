@@ -1563,6 +1563,42 @@ server.tool(
   }, "Error detecting waiting-for items")
 );
 
+server.tool(
+  "get-config",
+  "Get the current persistent configuration for apple-mail-mcp (defaultAccount, defaultMailbox, timeoutMs). Returns {} if no config file exists yet.",
+  {},
+  withErrorHandling(() => {
+    const config = mailManager.getConfig();
+    return successResponse(JSON.stringify(config, null, 2));
+  }, "Error getting config")
+);
+
+server.tool(
+  "set-config",
+  "Update one or more persistent configuration values. Only provided fields are changed; omitted fields retain their current values.",
+  {
+    defaultAccount: z
+      .string()
+      .optional()
+      .describe("Default Mail account name to use when none is specified"),
+    defaultMailbox: z
+      .string()
+      .optional()
+      .describe("Default mailbox name (e.g. INBOX) to use when none is specified"),
+    timeoutMs: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe("AppleScript timeout in milliseconds (e.g. 60000)"),
+  },
+  withErrorHandling(({ defaultAccount, defaultMailbox, timeoutMs }) => {
+    mailManager.setConfig({ defaultAccount, defaultMailbox, timeoutMs });
+    const updated = mailManager.getConfig();
+    return successResponse(`Config updated:\n${JSON.stringify(updated, null, 2)}`);
+  }, "Error setting config")
+);
+
 // =============================================================================
 // Server Startup
 // =============================================================================
