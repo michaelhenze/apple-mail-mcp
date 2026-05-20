@@ -616,17 +616,33 @@ server.tool(
   "save-attachment",
   {
     id: z.string().regex(/^\d+$/, "Message ID must be numeric"),
-    attachmentName: z.string().min(1, "Attachment name is required"),
+    attachmentName: z
+      .string()
+      .optional()
+      .describe("Attachment filename. Required if attachmentIndex is not provided."),
+    attachmentIndex: z
+      .number()
+      .int()
+      .min(1)
+      .optional()
+      .describe(
+        "1-based attachment index (alternative to attachmentName — useful when two attachments share a filename)"
+      ),
     savePath: z.string().min(1, "Save directory path is required"),
   },
-  withErrorHandling(({ id, attachmentName, savePath }) => {
-    const success = mailManager.saveAttachment(id, attachmentName, savePath);
+  withErrorHandling(({ id, attachmentName, attachmentIndex, savePath }) => {
+    if (!attachmentName && attachmentIndex === undefined) {
+      return errorResponse("Either attachmentName or attachmentIndex must be provided");
+    }
+    const success = mailManager.saveAttachment(id, attachmentName ?? "", savePath, attachmentIndex);
 
     if (!success) {
-      return errorResponse(`Failed to save attachment "${attachmentName}"`);
+      const label = attachmentName || `attachment #${attachmentIndex}`;
+      return errorResponse(`Failed to save ${label}`);
     }
 
-    return successResponse(`Attachment "${attachmentName}" saved to ${savePath}`);
+    const savedAs = attachmentName || `attachment #${attachmentIndex}`;
+    return successResponse(`Attachment "${savedAs}" saved to ${savePath}`);
   }, "Error saving attachment")
 );
 

@@ -1413,7 +1413,12 @@ export class AppleMailManager {
   /**
    * Save an attachment from a message to disk.
    */
-  saveAttachment(id: string, attachmentName: string, savePath: string): boolean {
+  saveAttachment(
+    id: string,
+    attachmentName: string,
+    savePath: string,
+    attachmentIndex?: number
+  ): boolean {
     if (!/^\d+$/.test(id)) {
       console.error(`Invalid message ID: "${id}"`);
       return false;
@@ -1422,6 +1427,32 @@ export class AppleMailManager {
     const safeName = escapeForAppleScript(attachmentName);
     const safePath = escapeForAppleScript(validatedPath);
 
+    const attachmentAccess =
+      attachmentIndex !== undefined
+        ? `
+                set msg to item 1 of matchingMsgs
+                set attCount to count of mail attachments of msg
+                if ${attachmentIndex} > attCount then
+                  return "error:Attachment index ${attachmentIndex} out of range (message has " & attCount & " attachment(s))"
+                end if
+                set att to mail attachment ${attachmentIndex} of msg
+                set attName to name of att
+                set attSavePath to POSIX file "${safePath}/" & attName
+                save att in attSavePath
+                return "ok"
+        `
+        : `
+                set msg to item 1 of matchingMsgs
+                repeat with att in mail attachments of msg
+                  if name of att is "${safeName}" then
+                    set attSavePath to POSIX file "${safePath}/${safeName}"
+                    save att in attSavePath
+                    return "ok"
+                  end if
+                end repeat
+                return "error:Attachment not found"
+        `;
+
     const script = buildAppLevelScript(`
       try
         repeat with acct in accounts
@@ -1429,15 +1460,7 @@ export class AppleMailManager {
             try
               set matchingMsgs to (messages of mb whose id is ${id})
               if (count of matchingMsgs) > 0 then
-                set msg to item 1 of matchingMsgs
-                repeat with att in mail attachments of msg
-                  if name of att is "${safeName}" then
-                    set savePath to POSIX file "${safePath}/${safeName}"
-                    save att in savePath
-                    return "ok"
-                  end if
-                end repeat
-                return "error:Attachment not found"
+                ${attachmentAccess}
               end if
             end try
           end repeat
