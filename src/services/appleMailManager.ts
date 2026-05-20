@@ -307,7 +307,10 @@ export class AppleMailManager {
     account?: string,
     limit = 50,
     dateFrom?: string,
-    dateTo?: string
+    dateTo?: string,
+    from?: string,
+    isRead?: boolean,
+    isFlagged?: boolean
   ): Message[] {
     // If no account specified, search across all accounts
     if (!account) {
@@ -316,7 +319,17 @@ export class AppleMailManager {
       for (const acct of accounts) {
         if (allMessages.length >= limit) break;
         const remaining = limit - allMessages.length;
-        const msgs = this.searchMessages(query, mailbox, acct.name, remaining, dateFrom, dateTo);
+        const msgs = this.searchMessages(
+          query,
+          mailbox,
+          acct.name,
+          remaining,
+          dateFrom,
+          dateTo,
+          from,
+          isRead,
+          isFlagged
+        );
         allMessages.push(...msgs);
       }
       return allMessages.slice(0, limit);
@@ -326,12 +339,26 @@ export class AppleMailManager {
     const requestedMailbox = mailbox || "INBOX";
     const targetMailbox = this.resolveMailbox(requestedMailbox, targetAccount);
 
-    // Build the search condition
-    let searchCondition = "";
+    // Build compound search conditions
+    const searchConditions: string[] = [];
+
     if (query) {
       const safeQuery = escapeForAppleScript(query);
-      searchCondition = `whose subject contains "${safeQuery}" or sender contains "${safeQuery}"`;
+      searchConditions.push(`(subject contains "${safeQuery}" or sender contains "${safeQuery}")`);
     }
+    if (from !== undefined) {
+      const safeFrom = escapeForAppleScript(from);
+      searchConditions.push(`sender contains "${safeFrom}"`);
+    }
+    if (isRead !== undefined) {
+      searchConditions.push(`read status is ${isRead}`);
+    }
+    if (isFlagged !== undefined) {
+      searchConditions.push(`flagged status is ${isFlagged}`);
+    }
+
+    const searchCondition =
+      searchConditions.length > 0 ? `whose (${searchConditions.join(" and ")})` : "";
 
     // Build date filter AppleScript
     let dateFilter = "";
@@ -513,14 +540,21 @@ export class AppleMailManager {
     account?: string,
     limit = 50,
     from?: string,
-    offset = 0
+    offset = 0,
+    unreadOnly?: boolean
   ): Message[] {
     const targetAccount = this.resolveAccount(account);
     const requestedMailbox = mailbox || "INBOX";
     const targetMailbox = this.resolveMailbox(requestedMailbox, targetAccount);
 
-    const safeFrom = from ? escapeForAppleScript(from) : "";
-    const fromFilter = from ? `whose sender contains "${safeFrom}"` : "";
+    const listConditions: string[] = [];
+    if (from) {
+      listConditions.push(`sender contains "${escapeForAppleScript(from)}"`);
+    }
+    if (unreadOnly) {
+      listConditions.push(`read status is false`);
+    }
+    const fromFilter = listConditions.length > 0 ? `whose (${listConditions.join(" and ")})` : "";
 
     const listCommand = `
       set fieldSep to character id 57345

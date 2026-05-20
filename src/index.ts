@@ -109,22 +109,35 @@ server.tool(
     dateTo: z.string().optional().describe("End date filter (e.g., 'March 1, 2026')"),
     limit: z.number().optional().describe("Maximum number of results (default: 50)"),
   },
-  withErrorHandling(({ query, mailbox, account, limit = 50, dateFrom, dateTo }) => {
-    const messages = mailManager.searchMessages(query, mailbox, account, limit, dateFrom, dateTo);
+  withErrorHandling(
+    ({ query, from, isRead, isFlagged, mailbox, account, limit = 50, dateFrom, dateTo }) => {
+      const messages = mailManager.searchMessages(
+        query,
+        mailbox,
+        account,
+        limit,
+        dateFrom,
+        dateTo,
+        from,
+        isRead,
+        isFlagged
+      );
 
-    if (messages.length === 0) {
-      return successResponse("No messages found matching criteria");
-    }
+      if (messages.length === 0) {
+        return successResponse("No messages found matching criteria");
+      }
 
-    const messageList = messages
-      .map(
-        (m) =>
-          `  - ID: ${m.id} | ${m.dateReceived.toLocaleDateString()} | ${m.subject} (from: ${m.sender}) [${m.isRead ? "read" : "unread"}]`
-      )
-      .join("\n");
+      const messageList = messages
+        .map(
+          (m) =>
+            `  - ID: ${m.id} | ${m.dateReceived.toLocaleDateString()} | ${m.subject} (from: ${m.sender}) [${m.isRead ? "read" : "unread"}]`
+        )
+        .join("\n");
 
-    return successResponse(`Found ${messages.length} message(s):\n${messageList}`);
-  }, "Error searching messages")
+      return successResponse(`Found ${messages.length} message(s):\n${messageList}`);
+    },
+    "Error searching messages"
+  )
 );
 
 // --- get-message ---
@@ -162,8 +175,8 @@ server.tool(
     from: z.string().optional().describe("Filter by sender email address or name"),
     unreadOnly: z.boolean().optional().describe("Only show unread messages"),
   },
-  withErrorHandling(({ mailbox, account, limit = 50, offset = 0, from }) => {
-    const messages = mailManager.listMessages(mailbox, account, limit, from, offset);
+  withErrorHandling(({ mailbox, account, limit = 50, offset = 0, from, unreadOnly }) => {
+    const messages = mailManager.listMessages(mailbox, account, limit, from, offset, unreadOnly);
 
     if (messages.length === 0) {
       return successResponse("No messages found");
