@@ -71,6 +71,8 @@ Complete the Apple Mail MCP server from a functional prototype to a production-q
 - `summarize-inbox` — concise daily briefing of unread mail (ideal as a morning start tool)
 - `unsubscribe-helper` — detect newsletters, extract unsubscribe links from HTML body
 - `draft-reply` — suggest a reply draft based on thread context (uses existing get-message + create-draft)
+- `summarize-thread` — collapse a long back-and-forth thread into a 3–5 sentence summary with current status and open questions (pairs with Phase 3's `get-thread`)
+- `detect-waiting-for` — scan sent mail for messages where no reply has arrived, ranked by how overdue they are
 
 **Estimated complexity:** Medium-low for the Claude-side logic; depends on Phase 2's full message data
 
@@ -100,3 +102,25 @@ Complete the Apple Mail MCP server from a functional prototype to a production-q
 5. **Phase 5** — Performance (can run anytime, but cache is most valuable after tools are complete)
 
 Phases 3 and 4 can run in parallel if desired.
+
+---
+
+## Backlog (unscheduled)
+
+Features considered but not yet assigned to a phase. Candidates for a future milestone.
+
+### Thread & Composition
+- `improve-draft` — suggest tone/clarity improvements on an existing draft without changing meaning
+- `translate-and-reply` — detect foreign-language emails, draft a reply in the sender's language
+
+### Scheduling & Coordination
+- `extract-meeting-requests` — parse emails for proposed meeting times, durations, and attendees into structured output
+- `find-deadlines` — extract date-referenced commitments from a mailbox into a ranked list
+
+### Pattern Recognition
+- `detect-recurring-senders` — identify senders you never reply to (newsletter candidates not yet unsubscribed)
+- `find-duplicates` — surface near-identical messages (forwarded threads, re-sent invoices, duplicate notifications) for bulk cleanup
+
+### Organisation
+- `suggest-rules` — analyse inbox patterns and propose Mail.app filter rules
+- `cluster-inbox` — group unread messages into topics (project, sender, urgency) as a read-only organisation view
