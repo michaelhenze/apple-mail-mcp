@@ -173,8 +173,9 @@ export class AppleMailManager {
 
   /**
    * Default account used when no account is specified.
+   * Stored with a 5-minute TTL so stale values are refreshed automatically.
    */
-  private defaultAccount: string | null = null;
+  private defaultAccountCache: { value: string; expiresAt: number } | null = null;
 
   /**
    * TTL cache for expensive AppleScript queries that rarely change.
@@ -188,6 +189,9 @@ export class AppleMailManager {
 
   /** Cache TTL in milliseconds (60 seconds). */
   private readonly CACHE_TTL_MS = 60_000;
+
+  /** TTL for the default account cache (5 minutes). */
+  private readonly DEFAULT_ACCOUNT_TTL_MS = 5 * 60_000;
 
   /**
    * Returns cached accounts or fetches fresh data if cache is expired/empty.
@@ -225,6 +229,7 @@ export class AppleMailManager {
   private invalidateCache(): void {
     this.cache.accounts = null;
     this.cache.mailboxNames.clear();
+    this.defaultAccountCache = null;
   }
 
   /**
@@ -234,7 +239,10 @@ export class AppleMailManager {
    */
   private resolveAccount(account?: string): string {
     if (account) return account;
-    if (this.defaultAccount) return this.defaultAccount;
+    const now = Date.now();
+    if (this.defaultAccountCache && now < this.defaultAccountCache.expiresAt) {
+      return this.defaultAccountCache.value;
+    }
 
     // Query Mail.app's default send account by inspecting a temporary outgoing message
     const defaultResult = executeAppleScript(
@@ -257,16 +265,22 @@ export class AppleMailManager {
         (a) => a.email.toLowerCase() === defaultEmail.toLowerCase()
       );
       if (matchedAccount) {
-        this.defaultAccount = matchedAccount.name;
-        return this.defaultAccount;
+        this.defaultAccountCache = {
+          value: matchedAccount.name,
+          expiresAt: Date.now() + this.DEFAULT_ACCOUNT_TTL_MS,
+        };
+        return this.defaultAccountCache!.value;
       }
     }
 
     // Fall back to first available account
     const accounts = this.getCachedAccounts();
     if (accounts.length > 0) {
-      this.defaultAccount = accounts[0].name;
-      return this.defaultAccount;
+      this.defaultAccountCache = {
+        value: accounts[0].name,
+        expiresAt: Date.now() + this.DEFAULT_ACCOUNT_TTL_MS,
+      };
+      return this.defaultAccountCache!.value;
     }
 
     return "iCloud"; // Last resort fallback
@@ -1827,7 +1841,7 @@ export class AppleMailManager {
   /**
    * List all mailboxes for an account.
    */
-  listMailboxes(account?: string): Mailbox[] {
+  listMailboxes(account?: string, includeCount = true): Mailbox[] {
     const targetAccount = this.resolveAccount(account);
 
     const listCommand = `
@@ -1835,7 +1849,7 @@ export class AppleMailManager {
       repeat with mb in mailboxes
         set mbName to name of mb
         set mbUnread to unread count of mb
-        set mbCount to count of messages of mb
+        ${includeCount ? "set mbCount to count of messages of mb" : "set mbCount to 0"}
         set end of mailboxList to mbName & (character id 57345) & mbUnread & (character id 57345) & mbCount
       end repeat
       set AppleScript's text item delimiters to (character id 57346)
@@ -2402,7 +2416,7 @@ export class AppleMailManager {
     }
 
     // Check 4: Basic operations work
-    const mailboxes = this.listMailboxes(accounts[0].name);
+    const mailboxes = this.listMailboxes(accounts[0].name, false);
     checks.push({
       name: "operations",
       passed: true,
