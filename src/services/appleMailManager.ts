@@ -13,6 +13,9 @@
  * @module services/appleMailManager
  */
 
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
+import { homedir } from "os";
+import { join } from "path";
 import { executeAppleScript } from "@/utils/applescript.js";
 import { validateSavePath } from "@/utils/pathSecurity.js";
 import type {
@@ -133,6 +136,12 @@ const HTML_SEP = "";
  * return null/false/empty-array on failure rather than throwing.
  */
 export class AppleMailManager {
+  private readonly TEMPLATE_FILE = join(homedir(), ".config", "apple-mail-mcp", "templates.json");
+
+  constructor() {
+    this.loadTemplates();
+  }
+
   /**
    * Default account used when no account is specified.
    */
@@ -1888,6 +1897,7 @@ export class AppleMailManager {
     const templateId = id || `tmpl_${this.nextTemplateId++}`;
     const template: EmailTemplate = { id: templateId, name, subject, body, to, cc };
     this.templates.set(templateId, template);
+    this.persistTemplates();
     return template;
   }
 
@@ -1895,7 +1905,47 @@ export class AppleMailManager {
    * Delete a template.
    */
   deleteTemplate(id: string): boolean {
-    return this.templates.delete(id);
+    const deleted = this.templates.delete(id);
+    if (deleted) this.persistTemplates();
+    return deleted;
+  }
+
+  /**
+   * Load templates from disk. Called in constructor.
+   */
+  private loadTemplates(): void {
+    try {
+      if (!existsSync(this.TEMPLATE_FILE)) return;
+      const raw = readFileSync(this.TEMPLATE_FILE, "utf8");
+      const data = JSON.parse(raw) as {
+        nextId: number;
+        templates: Record<string, EmailTemplate>;
+      };
+      this.templates = new Map(Object.entries(data.templates));
+      this.nextTemplateId = data.nextId;
+    } catch (err) {
+      // Corrupt or unreadable — start fresh, do not crash
+      console.error(`[apple-mail-mcp] Failed to load templates: ${err}`);
+    }
+  }
+
+  /**
+   * Persist templates to disk.
+   */
+  private persistTemplates(): void {
+    try {
+      const dir = join(homedir(), ".config", "apple-mail-mcp");
+      if (!existsSync(dir)) {
+        mkdirSync(dir, { recursive: true });
+      }
+      const data = {
+        nextId: this.nextTemplateId,
+        templates: Object.fromEntries(this.templates),
+      };
+      writeFileSync(this.TEMPLATE_FILE, JSON.stringify(data, null, 2), "utf8");
+    } catch (err) {
+      console.error(`[apple-mail-mcp] Failed to persist templates: ${err}`);
+    }
   }
 
   /**
