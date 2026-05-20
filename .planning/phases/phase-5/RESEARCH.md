@@ -23,6 +23,7 @@ All five streams are clearly scoped, low-risk changes within a single file (`app
 | Message-ID location cache | Service layer (AppleMailManager) | — | Cache lives inside the class alongside existing `this.cache`; no new tier needed |
 | listMailboxes lazy count | Service layer (AppleMailManager) | MCP tool layer (index.ts) | Method signature change; tool handlers pass `includeCount` flag |
 | Persistent config file | Service layer (AppleMailManager) | Filesystem (~/.config/…) | Follows template persistence pattern already in the class |
+| get-config / set-config MCP tools | MCP tool layer (index.ts) | Service layer (AppleMailManager) | Tools delegate to service getConfig/setConfig methods |
 | Dependency updates | Toolchain (package.json) | — | Pure npm/build concern |
 | defaultAccount TTL fix | Service layer (AppleMailManager) | — | `resolveAccount()` sets `this.defaultAccount` with no expiry |
 
@@ -239,9 +240,9 @@ private config: {
 | `defaultMailbox` | Useful for users who primarily work in a non-INBOX folder | Hardcoded `"INBOX"` in `listMessages`, `searchMessages` |
 | `timeoutMs` | Power users on slow IMAP may want longer timeouts | `{ timeoutMs: 60000 }` passed to many `executeAppleScript` calls |
 
-**Interaction with `defaultAccount` field:** If `config.defaultAccount` is set on load, assign it to `this.defaultAccount` in the constructor before the existing `resolveAccount` logic runs. This means the config-file default takes precedence over Mail.app's configured send account. [ASSUMED — needs user confirmation on precedence preference]
+**Interaction with `defaultAccount` field (RESOLVED — D-01):** If `config.defaultAccount` is set on load, assign it to `this.defaultAccount` in the constructor as a seed/preference hint. The runtime `resolveAccount()` will validate the account still exists; if not found, it falls back to Mail.app's dynamic resolution. Config value is a preference, not a hard override.
 
-**MCP tool:** A `get-config` / `set-config` MCP tool is out of scope for Phase 5 — the config file is a power-user feature editable directly. [ASSUMED — no tool layer needed unless roadmap says otherwise]
+**MCP tools:** `get-config` and `set-config` tools ARE included in Phase 5 (RESOLVED — D-02). They are registered in `src/index.ts` and delegate to `getConfig()` / `setConfig(partial)` service methods.
 
 ---
 
@@ -266,7 +267,7 @@ private config: {
 
 **New dependencies in 1.29.0:** The SDK gains several new runtime dependencies (`@hono/node-server`, `express`, `jose`, `hono`, `pkce-challenge`, etc.) for OAuth and HTTP transport features that are not used by this project. These add to `node_modules` size but do not affect the stdio transport used here.
 
-**`@cfworker/json-schema` peer dep:** New in 1.29.0. It is listed as a peer dependency but is optional — it is only required if using the AJV or cfworker schema validation backends. This project uses Zod directly. npm may warn about missing peer dep; add `--legacy-peer-deps` if needed or install `@cfworker/json-schema` as devDependency. [ASSUMED — verify whether npm install warns during update]
+**`@cfworker/json-schema` peer dep (RESOLVED — D-03):** New in 1.29.0. It is listed as a peer dependency but is only required for AJV/cfworker schema validation backends not used by this project. npm may warn during install. Treat as warn-and-continue: log the warning, do not block npm install, do not add `--legacy-peer-deps` unless npm errors (not warns).
 
 **API surface used by this project:**
 - `McpServer` from `server/mcp.js` — stable across 1.x [ASSUMED]
@@ -389,16 +390,15 @@ Two changes:
 
 ### Pitfall 4: Config File Overriding Dynamic Mail.app State
 **What goes wrong:** User sets `defaultAccount: "iCloud"` in config but later switches to a new Gmail account. The config file overrides the dynamic resolution.
-**How to avoid:** Config file sets a preference, not an override. Document that config values are hints — `resolveAccount()` should still fall back to dynamic resolution if the config-specified account no longer exists.
+**How to avoid:** Config file sets a preference hint, not an override. `resolveAccount()` seeds from config but validates the account still exists; falls back to Mail.app resolution if not found.
 **Warning signs:** "Account not found" errors on send after account setup changes.
 
 ### Pitfall 5: vitest v4 `@vitest/coverage-v8` Version Mismatch
 **What goes wrong:** `vitest@4.x` installed but `@vitest/coverage-v8@2.x` left behind. Coverage run fails with peer dependency error.
 **How to avoid:** Always update both packages together in a single `npm install` command.
 
-### Pitfall 6: SDK 1.29.0 `@cfworker/json-schema` Peer Dep Warning
-**What goes wrong:** `npm install @modelcontextprotocol/sdk@^1.29.0` warns about missing peer `@cfworker/json-schema`.
-**How to avoid:** Either ignore the warning (the dep is only used for optional schema validation backends not used here) or install it as a devDependency.
+### Pitfall 6: SDK 1.29.0 `@cfworker/json-schema` Peer Dep Warning (RESOLVED — D-03)
+**Resolution:** Treat as warn-and-continue. Log the warning during `npm install`. Do not block. Do not add `--legacy-peer-deps` unless the install actually errors (not warns). The dep is only used for optional schema validation backends not used by this project.
 
 ---
 
@@ -463,16 +463,17 @@ private cacheMessageLocation(id: string, mailbox: string, account: string): void
 | `defaultAccount` permanent | TTL + invalidation | Phase 5 | Picks up Mail.app account changes without restart |
 | Pinned SDK 1.4.1 | Range `^1.29.0` | Phase 5 | Gets OAuth, HTTP transport, and security fixes |
 | vitest 2.x | vitest 4.x | Phase 5 | vite 6 alignment, maintained toolchain |
+| Config file (no MCP tools) | Config file + get-config/set-config tools | Phase 5 | Usable by AI assistants without direct filesystem access |
 
 ---
 
 ## Implementation Order (Recommended)
 
-1. **Message-ID location cache** — highest runtime impact, pure additive change
-2. **`defaultAccount` TTL fix** — touches `resolveAccount()` which is exercised by every op; do before cache to avoid resetting work
-3. **Persistent config file** — user-visible, follows template pattern exactly
-4. **`listMailboxes` lazy count** — small method signature change, update `healthCheck()` caller
-5. **Dependency updates** — last, so a broken build does not block other tasks; update all three in one commit
+1. **Dependency updates** — align toolchain first so all subsequent work compiles against the right SDK version
+2. **defaultAccount TTL fix + listMailboxes lazy count** — small targeted fixes before cache work
+3. **Message-ID location cache infrastructure** — additive private fields and helpers
+4. **Cache fast-path** — the actual scan-skip logic in `findMessageScript` / wrapper
+5. **Persistent config file + get-config / set-config tools** — user-visible, follows template pattern
 
 ---
 
@@ -520,22 +521,16 @@ private cacheMessageLocation(id: string, mailbox: string, account: string): void
 
 ---
 
-## Open Questions
+## Open Questions (RESOLVED)
 
-1. **Config file: should `defaultAccount` in config override or seed?**
-   - What we know: `resolveAccount()` currently sets `this.defaultAccount` via Mail.app API on first call
-   - What's unclear: If user sets `defaultAccount: "Gmail"` in config but Mail.app default is "iCloud", which wins?
-   - Recommendation: Config is a preference hint. Use it as the initial value but validate it exists in account list; fall back to Mail.app resolution if not found. [ASSUMED]
+1. **Q1 — Config file: should `defaultAccount` in config override or seed?**
+   - **RESOLVED:** Acts as a preference hint that seeds the TTL cache on load. Does not hard-override runtime discovery. `resolveAccount()` validates the seeded account still exists in the account list; falls back to Mail.app dynamic resolution if not found.
 
-2. **Message-ID cache TTL value**
-   - What we know: Messages can be moved between mailboxes, but this is a relatively rare user action
-   - What's unclear: Whether 5 minutes is too long for active workflows
-   - Recommendation: 5 minutes is reasonable; make it configurable via the config file in the same phase [ASSUMED]
+2. **Q2 — get-config / set-config MCP tool scope**
+   - **RESOLVED:** Both `get-config` (read) and `set-config` (partial update) tools ARE included in Phase 5. They are registered in `src/index.ts` and delegate to `getConfig()` / `setConfig(partial)` service methods.
 
-3. **SDK peer dep `@cfworker/json-schema`**
-   - What we know: Listed as peer dep in 1.29.0
-   - What's unclear: Whether `npm install` warns or errors; whether `--legacy-peer-deps` is needed
-   - Recommendation: Run the install and check; if warning only, document and proceed; if error, add as devDependency
+3. **Q3 — SDK peer dep `@cfworker/json-schema`**
+   - **RESOLVED:** Treat as warn-and-continue. Log the warning output, do not block `npm install`, do not add `--legacy-peer-deps` unless the install actually errors. The dep is only required for optional schema validation backends not used by this project.
 
 ---
 
