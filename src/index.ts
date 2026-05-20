@@ -25,6 +25,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { AppleMailManager } from "@/services/appleMailManager.js";
+import { emailAddressSchema } from "@/utils/emailValidation.js";
 
 // Read version from package.json to keep it in sync
 const require = createRequire(import.meta.url);
@@ -108,23 +109,60 @@ server.tool(
     dateFrom: z.string().optional().describe("Start date filter (e.g., 'January 1, 2026')"),
     dateTo: z.string().optional().describe("End date filter (e.g., 'March 1, 2026')"),
     limit: z.number().optional().describe("Maximum number of results (default: 50)"),
+    allMailboxes: z
+      .boolean()
+      .optional()
+      .describe(
+        "Search across all mailboxes in the account (not just INBOX). May be slow on large mail stores."
+      ),
+    offset: z
+      .number()
+      .optional()
+      .describe("Number of results to skip (for pagination, default: 0)"),
   },
-  withErrorHandling(({ query, mailbox, account, limit = 50, dateFrom, dateTo }) => {
-    const messages = mailManager.searchMessages(query, mailbox, account, limit, dateFrom, dateTo);
+  withErrorHandling(
+    ({
+      query,
+      from,
+      isRead,
+      isFlagged,
+      mailbox,
+      account,
+      limit = 50,
+      offset = 0,
+      dateFrom,
+      dateTo,
+      allMailboxes,
+    }) => {
+      const messages = mailManager.searchMessages(
+        query,
+        mailbox,
+        account,
+        limit,
+        dateFrom,
+        dateTo,
+        from,
+        isRead,
+        isFlagged,
+        allMailboxes,
+        offset
+      );
 
-    if (messages.length === 0) {
-      return successResponse("No messages found matching criteria");
-    }
+      if (messages.length === 0) {
+        return successResponse("No messages found matching criteria");
+      }
 
-    const messageList = messages
-      .map(
-        (m) =>
-          `  - ID: ${m.id} | ${m.dateReceived.toLocaleDateString()} | ${m.subject} (from: ${m.sender}) [${m.isRead ? "read" : "unread"}]`
-      )
-      .join("\n");
+      const messageList = messages
+        .map(
+          (m) =>
+            `  - ID: ${m.id} | ${m.dateReceived.toLocaleDateString()} | ${m.subject} (from: ${m.sender}) [${m.isRead ? "read" : "unread"}]`
+        )
+        .join("\n");
 
-    return successResponse(`Found ${messages.length} message(s):\n${messageList}`);
-  }, "Error searching messages")
+      return successResponse(`Found ${messages.length} message(s):\n${messageList}`);
+    },
+    "Error searching messages"
+  )
 );
 
 // --- get-message ---
@@ -132,7 +170,7 @@ server.tool(
 server.tool(
   "get-message",
   {
-    id: z.string().min(1, "Message ID is required"),
+    id: z.string().regex(/^\d+$/, "Message ID must be numeric"),
     preferHtml: z.boolean().optional().describe("Return HTML source instead of plain text"),
   },
   withErrorHandling(({ id, preferHtml }) => {
@@ -162,8 +200,8 @@ server.tool(
     from: z.string().optional().describe("Filter by sender email address or name"),
     unreadOnly: z.boolean().optional().describe("Only show unread messages"),
   },
-  withErrorHandling(({ mailbox, account, limit = 50, offset = 0, from }) => {
-    const messages = mailManager.listMessages(mailbox, account, limit, from, offset);
+  withErrorHandling(({ mailbox, account, limit = 50, offset = 0, from, unreadOnly }) => {
+    const messages = mailManager.listMessages(mailbox, account, limit, from, offset, unreadOnly);
 
     if (messages.length === 0) {
       return successResponse("No messages found");
@@ -185,21 +223,32 @@ server.tool(
 server.tool(
   "send-email",
   {
-    to: z.array(z.string()).min(1, "At least one recipient is required"),
+    to: z.array(emailAddressSchema).min(1, "At least one recipient is required"),
     subject: z.string().min(1, "Subject is required"),
     body: z.string().min(1, "Body is required"),
-    cc: z.array(z.string()).optional().describe("CC recipients"),
-    bcc: z.array(z.string()).optional().describe("BCC recipients"),
+    cc: z.array(emailAddressSchema).optional().describe("CC recipients"),
+    bcc: z.array(emailAddressSchema).optional().describe("BCC recipients"),
     account: z.string().optional().describe("Account to send from"),
+    attachments: z
+      .array(z.string())
+      .optional()
+      .describe("Absolute file paths to attach (e.g., ['/Users/me/report.pdf'])"),
+    isHtml: z
+      .boolean()
+      .optional()
+      .describe(
+        "Send as HTML email. When true, body is rendered as HTML markup rather than plain text."
+      ),
   },
-  withErrorHandling(({ to, subject, body, cc, bcc, account }) => {
-    const success = mailManager.sendEmail(to, subject, body, cc, bcc, account);
+  withErrorHandling(({ to, subject, body, cc, bcc, account, attachments, isHtml }) => {
+    const success = mailManager.sendEmail(to, subject, body, cc, bcc, account, attachments, isHtml);
 
     if (!success) {
       return errorResponse("Failed to send email. Check Mail.app configuration.");
     }
 
-    return successResponse(`Email sent to ${to.join(", ")}`);
+    const attachInfo = attachments?.length ? ` with ${attachments.length} attachment(s)` : "";
+    return successResponse(`Email sent to ${to.join(", ")}${attachInfo}`);
   }, "Error sending email")
 );
 
@@ -208,21 +257,41 @@ server.tool(
 server.tool(
   "create-draft",
   {
-    to: z.array(z.string()).min(1, "At least one recipient is required"),
+    to: z.array(emailAddressSchema).min(1, "At least one recipient is required"),
     subject: z.string().min(1, "Subject is required"),
     body: z.string().min(1, "Body is required"),
-    cc: z.array(z.string()).optional().describe("CC recipients"),
-    bcc: z.array(z.string()).optional().describe("BCC recipients"),
+    cc: z.array(emailAddressSchema).optional().describe("CC recipients"),
+    bcc: z.array(emailAddressSchema).optional().describe("BCC recipients"),
     account: z.string().optional().describe("Account to create draft in"),
+    attachments: z
+      .array(z.string())
+      .optional()
+      .describe("Absolute file paths to attach (e.g., ['/Users/me/report.pdf'])"),
+    isHtml: z
+      .boolean()
+      .optional()
+      .describe(
+        "Create as HTML email. When true, body is rendered as HTML markup rather than plain text."
+      ),
   },
-  withErrorHandling(({ to, subject, body, cc, bcc, account }) => {
-    const success = mailManager.createDraft(to, subject, body, cc, bcc, account);
+  withErrorHandling(({ to, subject, body, cc, bcc, account, attachments, isHtml }) => {
+    const success = mailManager.createDraft(
+      to,
+      subject,
+      body,
+      cc,
+      bcc,
+      account,
+      attachments,
+      isHtml
+    );
 
     if (!success) {
       return errorResponse("Failed to create draft. Check Mail.app configuration.");
     }
 
-    return successResponse(`Draft created for ${to.join(", ")}`);
+    const attachInfo = attachments?.length ? ` with ${attachments.length} attachment(s)` : "";
+    return successResponse(`Draft created for ${to.join(", ")}${attachInfo}`);
   }, "Error creating draft")
 );
 
@@ -231,7 +300,7 @@ server.tool(
 server.tool(
   "reply-to-message",
   {
-    id: z.string().min(1, "Message ID is required"),
+    id: z.string().regex(/^\d+$/, "Message ID must be numeric"),
     body: z.string().min(1, "Reply body is required"),
     replyAll: z.boolean().optional().default(false).describe("Reply to all recipients"),
     send: z.boolean().optional().default(true).describe("Send immediately (false = save as draft)"),
@@ -252,8 +321,8 @@ server.tool(
 server.tool(
   "forward-message",
   {
-    id: z.string().min(1, "Message ID is required"),
-    to: z.array(z.string()).min(1, "At least one recipient is required"),
+    id: z.string().regex(/^\d+$/, "Message ID must be numeric"),
+    to: z.array(emailAddressSchema).min(1, "At least one recipient is required"),
     body: z.string().optional().describe("Optional message to prepend"),
     send: z.boolean().optional().default(true).describe("Send immediately (false = save as draft)"),
   },
@@ -275,7 +344,7 @@ server.tool(
 server.tool(
   "mark-as-read",
   {
-    id: z.string().min(1, "Message ID is required"),
+    id: z.string().regex(/^\d+$/, "Message ID must be numeric"),
   },
   withErrorHandling(({ id }) => {
     const success = mailManager.markAsRead(id);
@@ -293,7 +362,7 @@ server.tool(
 server.tool(
   "mark-as-unread",
   {
-    id: z.string().min(1, "Message ID is required"),
+    id: z.string().regex(/^\d+$/, "Message ID must be numeric"),
   },
   withErrorHandling(({ id }) => {
     const success = mailManager.markAsUnread(id);
@@ -311,7 +380,7 @@ server.tool(
 server.tool(
   "flag-message",
   {
-    id: z.string().min(1, "Message ID is required"),
+    id: z.string().regex(/^\d+$/, "Message ID must be numeric"),
   },
   withErrorHandling(({ id }) => {
     const success = mailManager.flagMessage(id);
@@ -329,7 +398,7 @@ server.tool(
 server.tool(
   "unflag-message",
   {
-    id: z.string().min(1, "Message ID is required"),
+    id: z.string().regex(/^\d+$/, "Message ID must be numeric"),
   },
   withErrorHandling(({ id }) => {
     const success = mailManager.unflagMessage(id);
@@ -347,7 +416,7 @@ server.tool(
 server.tool(
   "delete-message",
   {
-    id: z.string().min(1, "Message ID is required"),
+    id: z.string().regex(/^\d+$/, "Message ID must be numeric"),
   },
   withErrorHandling(({ id }) => {
     const success = mailManager.deleteMessage(id);
@@ -365,7 +434,7 @@ server.tool(
 server.tool(
   "move-message",
   {
-    id: z.string().min(1, "Message ID is required"),
+    id: z.string().regex(/^\d+$/, "Message ID must be numeric"),
     mailbox: z.string().min(1, "Destination mailbox is required"),
     account: z.string().optional().describe("Account containing the destination mailbox"),
   },
@@ -521,7 +590,7 @@ server.tool(
 server.tool(
   "list-attachments",
   {
-    id: z.string().min(1, "Message ID is required"),
+    id: z.string().regex(/^\d+$/, "Message ID must be numeric"),
   },
   withErrorHandling(({ id }) => {
     const attachments = mailManager.listAttachments(id);
@@ -546,18 +615,34 @@ server.tool(
 server.tool(
   "save-attachment",
   {
-    id: z.string().min(1, "Message ID is required"),
-    attachmentName: z.string().min(1, "Attachment name is required"),
+    id: z.string().regex(/^\d+$/, "Message ID must be numeric"),
+    attachmentName: z
+      .string()
+      .optional()
+      .describe("Attachment filename. Required if attachmentIndex is not provided."),
+    attachmentIndex: z
+      .number()
+      .int()
+      .min(1)
+      .optional()
+      .describe(
+        "1-based attachment index (alternative to attachmentName — useful when two attachments share a filename)"
+      ),
     savePath: z.string().min(1, "Save directory path is required"),
   },
-  withErrorHandling(({ id, attachmentName, savePath }) => {
-    const success = mailManager.saveAttachment(id, attachmentName, savePath);
+  withErrorHandling(({ id, attachmentName, attachmentIndex, savePath }) => {
+    if (!attachmentName && attachmentIndex === undefined) {
+      return errorResponse("Either attachmentName or attachmentIndex must be provided");
+    }
+    const success = mailManager.saveAttachment(id, attachmentName ?? "", savePath, attachmentIndex);
 
     if (!success) {
-      return errorResponse(`Failed to save attachment "${attachmentName}"`);
+      const label = attachmentName || `attachment #${attachmentIndex}`;
+      return errorResponse(`Failed to save ${label}`);
     }
 
-    return successResponse(`Attachment "${attachmentName}" saved to ${savePath}`);
+    const savedAs = attachmentName || `attachment #${attachmentIndex}`;
+    return successResponse(`Attachment "${savedAs}" saved to ${savePath}`);
   }, "Error saving attachment")
 );
 
@@ -781,8 +866,8 @@ server.tool(
     name: z.string().min(1, "Template name is required"),
     subject: z.string().min(1, "Subject is required"),
     body: z.string().min(1, "Body is required"),
-    to: z.array(z.string()).optional().describe("Default recipients"),
-    cc: z.array(z.string()).optional().describe("Default CC recipients"),
+    to: z.array(emailAddressSchema).optional().describe("Default recipients"),
+    cc: z.array(emailAddressSchema).optional().describe("Default CC recipients"),
     id: z.string().optional().describe("Template ID (for updating existing template)"),
   },
   withErrorHandling(({ name, subject, body, to, cc, id }) => {
@@ -864,8 +949,8 @@ server.tool(
   "use-template",
   {
     id: z.string().min(1, "Template ID is required"),
-    to: z.array(z.string()).optional().describe("Override recipients"),
-    cc: z.array(z.string()).optional().describe("Override CC recipients"),
+    to: z.array(emailAddressSchema).optional().describe("Override recipients"),
+    cc: z.array(emailAddressSchema).optional().describe("Override CC recipients"),
     subject: z.string().optional().describe("Override subject"),
     body: z.string().optional().describe("Override body"),
   },
@@ -878,6 +963,202 @@ server.tool(
 
     return successResponse(`Draft created from template "${id}"`);
   }, "Error using template")
+);
+
+// =============================================================================
+// Junk Mail Tools
+// =============================================================================
+
+// --- move-to-junk ---
+
+server.tool(
+  "move-to-junk",
+  {
+    id: z
+      .string()
+      .regex(/^\d+$/, "Message ID must be numeric")
+      .describe("Unique message ID (from list-messages or search-messages)"),
+  },
+  withErrorHandling(({ id }) => {
+    const success = mailManager.moveToJunk(id);
+    if (!success) {
+      return errorResponse(
+        `Failed to mark message "${id}" as junk. The message may not exist or the Junk mailbox may be unavailable.`
+      );
+    }
+    return successResponse(`Message "${id}" marked as junk and moved to Junk mailbox.`);
+  }, "Error marking message as junk")
+);
+
+// --- mark-as-not-junk ---
+
+server.tool(
+  "mark-as-not-junk",
+  {
+    id: z
+      .string()
+      .regex(/^\d+$/, "Message ID must be numeric")
+      .describe("Unique message ID (from list-messages or search-messages)"),
+  },
+  withErrorHandling(({ id }) => {
+    const success = mailManager.markAsNotJunk(id);
+    if (!success) {
+      return errorResponse(
+        `Failed to clear junk flag on message "${id}". The message may not exist.`
+      );
+    }
+    return successResponse(
+      `Message "${id}" junk flag cleared. The message remains in its current mailbox — use move-message to restore it to INBOX if needed.`
+    );
+  }, "Error clearing junk flag")
+);
+
+// =============================================================================
+// Archive Tools
+// =============================================================================
+
+// --- archive-message ---
+
+server.tool(
+  "archive-message",
+  {
+    id: z
+      .string()
+      .regex(/^\d+$/, "Message ID must be numeric")
+      .describe("Unique message ID (from list-messages or search-messages)"),
+    account: z
+      .string()
+      .optional()
+      .describe("Account whose Archive mailbox to use (omit to use default account)"),
+  },
+  withErrorHandling(({ id, account }) => {
+    const success = mailManager.archiveMessage(id, account);
+    if (!success) {
+      return errorResponse(
+        `Failed to archive message "${id}". The Archive mailbox may be unavailable for this account.`
+      );
+    }
+    return successResponse(
+      `Message "${id}" archived. Note: Gmail accounts may leave the Inbox label due to Gmail's IMAP label model.`
+    );
+  }, "Error archiving message")
+);
+
+// --- batch-archive ---
+
+server.tool(
+  "batch-archive",
+  {
+    ids: z
+      .array(z.string().regex(/^\d+$/, "Message ID must be numeric"))
+      .min(1, "At least one message ID required")
+      .describe("Array of message IDs to archive"),
+    account: z
+      .string()
+      .optional()
+      .describe("Account whose Archive mailbox to use (omit to use default account)"),
+  },
+  withErrorHandling(({ ids, account }) => {
+    const results = mailManager.batchArchiveMessages(ids, account);
+    const succeeded = results.filter((r) => r.success).length;
+    const failed = results.filter((r) => !r.success);
+
+    const lines: string[] = [`Archived ${succeeded}/${results.length} messages.`];
+    if (failed.length > 0) {
+      lines.push(`Failed: ${failed.map((r) => r.id).join(", ")}`);
+    }
+
+    return successResponse(lines.join("\n"));
+  }, "Error batch archiving messages")
+);
+
+// =============================================================================
+// Thread Tools
+// =============================================================================
+
+// --- get-thread ---
+
+server.tool(
+  "get-thread",
+  {
+    id: z
+      .string()
+      .regex(/^\d+$/, "Message ID must be numeric")
+      .describe("ID of any message in the thread (seed message)"),
+    account: z
+      .string()
+      .optional()
+      .describe(
+        "Limit thread search to this account (faster). Omit to search all accounts (slower, more complete)."
+      ),
+  },
+  withErrorHandling(({ id, account }) => {
+    const messages = mailManager.getThread(id, account);
+
+    if (messages.length === 0) {
+      return successResponse(
+        `No thread found for message "${id}". The subject may be too short or the message may not exist.`
+      );
+    }
+
+    const lines: string[] = [
+      `Thread: ${messages.length} message${messages.length === 1 ? "" : "s"} (oldest first)`,
+      ``,
+    ];
+
+    for (let i = 0; i < messages.length; i++) {
+      const m = messages[i];
+      const dateStr = m.dateReceived.toLocaleString();
+      const readStatus = m.isRead ? "Read" : "Unread";
+      lines.push(`[${i + 1}] ID: ${m.id}  ${readStatus}`);
+      lines.push(`    From: ${m.sender}`);
+      lines.push(`    Subject: ${m.subject}`);
+      lines.push(`    Date: ${dateStr}`);
+      lines.push(`    Mailbox: ${m.mailbox} (${m.account})`);
+      lines.push(``);
+    }
+
+    return successResponse(lines.join("\n").trimEnd());
+  }, "Error getting thread")
+);
+
+// =============================================================================
+// VIP Tools
+// =============================================================================
+
+// --- get-vip-messages ---
+
+server.tool(
+  "get-vip-messages",
+  {
+    limit: z.number().optional().describe("Max messages per VIP sender to retrieve (default: 50)"),
+  },
+  withErrorHandling(({ limit }) => {
+    const { messages, vipSenders, error } = mailManager.getVipMessages(limit ?? 50);
+
+    if (error && messages.length === 0) {
+      return successResponse(`VIP messages: none\n\n${error}`);
+    }
+
+    const lines: string[] = [
+      `VIP Senders (${vipSenders.length}): ${vipSenders.join(", ")}`,
+      `Messages from VIP senders: ${messages.length}`,
+      ``,
+    ];
+
+    for (const m of messages) {
+      const dateStr = m.dateReceived.toLocaleString();
+      const readStatus = m.isRead ? "Read" : "Unread";
+      lines.push(`ID: ${m.id}  [${readStatus}]`);
+      lines.push(`  From: ${m.sender}`);
+      lines.push(`  Subject: ${m.subject}`);
+      lines.push(`  Date: ${dateStr}`);
+      lines.push(`  Mailbox: ${m.mailbox}`);
+      lines.push(``);
+    }
+
+    return successResponse(lines.join("\n").trimEnd());
+  }, "Error getting VIP messages")
 );
 
 // =============================================================================
@@ -951,18 +1232,371 @@ server.tool(
     const status = mailManager.getSyncStatus();
 
     const lines: string[] = [];
-    lines.push(`🔄 Mail Sync Status`);
+    lines.push(`Mail Sync Status`);
     lines.push(`═══════════════════`);
 
     if (status.error) {
-      lines.push(`Status: ⚠️ ${status.error}`);
+      lines.push(`Status: ${status.error}`);
     } else {
-      lines.push(`Mail.app: ${status.recentActivity ? "Running" : "Not running"}`);
-      lines.push(`Sync active: ${status.syncDetected ? "Yes" : "No"}`);
+      lines.push(`Mail.app: ${status.running ? "Running" : "Not running"}`);
+      lines.push(`Accounts loaded: ${status.accountCount}`);
+      lines.push(``);
+      lines.push(
+        `Note: Apple Mail does not expose IMAP sync state via AppleScript. Only running status and account count are observable.`
+      );
     }
 
     return successResponse(lines.join("\n"));
   }, "Error getting sync status")
+);
+
+// =============================================================================
+// Intelligence Layer Tools (Phase 4)
+// =============================================================================
+
+server.tool(
+  "triage-inbox",
+  {
+    limit: z
+      .number()
+      .optional()
+      .describe(
+        "Max unread messages to fetch (default: 20). Keep low if includeSnippets=true — each snippet is one AppleScript call."
+      ),
+    includeSnippets: z
+      .boolean()
+      .optional()
+      .describe(
+        "Fetch first 200 chars of body per message (default: true). Set false for faster results on large inboxes."
+      ),
+    mailbox: z.string().optional().describe("Mailbox to triage (default: INBOX)"),
+    account: z.string().optional().describe("Account to triage (omit for default account)"),
+  },
+  withErrorHandling(({ limit = 20, includeSnippets = true, mailbox = "INBOX", account }) => {
+    const messages = mailManager.getTriageMessages(mailbox, limit, includeSnippets, account);
+
+    if (messages.length === 0) {
+      return successResponse("Triage data: 0 unread messages found.");
+    }
+
+    const lines: string[] = [
+      `Triage data: ${messages.length} unread message(s) in ${mailbox}`,
+      "",
+      "Classify each as: urgent / FYI / deletable",
+      "═══════════════════════════════════════════",
+      "",
+    ];
+
+    messages.forEach((msg, i) => {
+      lines.push(`[${i + 1}] ID: ${msg.id}`);
+      lines.push(`  From: ${msg.sender}`);
+      lines.push(`  Subject: ${msg.subject}`);
+      lines.push(`  Date: ${msg.dateReceived.toISOString().slice(0, 16).replace("T", " ")}`);
+      lines.push(
+        `  Flagged: ${msg.isFlagged ? "yes" : "no"} | Attachments: ${msg.hasAttachments ? "yes" : "no"}`
+      );
+      if (msg.snippet) lines.push(`  Snippet: "${msg.snippet}"`);
+      lines.push("");
+    });
+
+    return successResponse(lines.join("\n"));
+  }, "Error triaging inbox")
+);
+
+server.tool(
+  "find-action-items",
+  {
+    id: z
+      .string()
+      .optional()
+      .describe("Message ID to scan (single message mode). Provide this OR mailbox, not both."),
+    mailbox: z
+      .string()
+      .optional()
+      .describe("Mailbox to scan for action items (default: INBOX). Used when id is not provided."),
+    limit: z
+      .number()
+      .optional()
+      .describe(
+        "Max messages to scan in mailbox mode (default: 10). Each message is one AppleScript call."
+      ),
+    account: z.string().optional().describe("Account to scan (omit for default account)"),
+  },
+  withErrorHandling(({ id, mailbox = "INBOX", limit = 10, account }) => {
+    const results = mailManager.getActionItems(id, mailbox, limit, account);
+
+    if (results.length === 0) {
+      return successResponse("No messages found for action-item extraction.");
+    }
+
+    const lines: string[] = [
+      `Action item source data: ${results.length} message(s)`,
+      "",
+      "Extract to-dos, deadlines, and requests from the bodies below.",
+      "═══════════════════════════════════════════════════════════════",
+      "",
+    ];
+
+    results.forEach((item, i) => {
+      lines.push(`[${i + 1}] ID: ${item.id}`);
+      lines.push(`  From: ${item.sender}`);
+      lines.push(`  Subject: ${item.subject}`);
+      lines.push(`  Date: ${item.dateReceived.toISOString().slice(0, 16).replace("T", " ")}`);
+      lines.push("  Body:");
+      lines.push(
+        item.plainText
+          .split("\n")
+          .map((l) => `    ${l}`)
+          .join("\n")
+      );
+      lines.push("");
+    });
+
+    return successResponse(lines.join("\n"));
+  }, "Error finding action items")
+);
+
+server.tool(
+  "summarize-inbox",
+  {
+    mailbox: z.string().optional().describe("Mailbox to summarize (default: INBOX)"),
+    limit: z
+      .number()
+      .optional()
+      .describe("Max unread messages to include in briefing data (default: 30)"),
+    account: z.string().optional().describe("Account to summarize (omit for all accounts)"),
+  },
+  withErrorHandling(({ mailbox = "INBOX", limit = 30, account }) => {
+    const { totalUnread, messages } = mailManager.getSummarizeInboxData(mailbox, limit, account);
+
+    const lines: string[] = [
+      `Inbox briefing data: ${totalUnread} total unread in ${mailbox}`,
+      `Showing ${messages.length} message(s)`,
+      "",
+      "Produce a concise morning briefing summarizing who wrote, about what, and any notable patterns.",
+      "═══════════════════════════════════════════════════════════════════════════════════════════════",
+      "",
+    ];
+
+    messages.forEach((msg, i) => {
+      lines.push(`[${i + 1}] From: ${msg.sender}`);
+      lines.push(`    Subject: ${msg.subject}`);
+      lines.push(`    Date: ${msg.dateReceived.toISOString().slice(0, 16).replace("T", " ")}`);
+      lines.push(
+        `    Flagged: ${msg.isFlagged ? "yes" : "no"} | Attachments: ${msg.hasAttachments ? "yes" : "no"}`
+      );
+      lines.push("");
+    });
+
+    return successResponse(lines.join("\n"));
+  }, "Error summarizing inbox")
+);
+
+server.tool(
+  "unsubscribe-helper",
+  {
+    id: z.string().describe("Message ID to inspect for unsubscribe links"),
+  },
+  withErrorHandling(({ id }) => {
+    const result = mailManager.getUnsubscribeLinks(id);
+
+    const lines: string[] = [
+      `Unsubscribe analysis for message ${id}`,
+      "═══════════════════════════════════════",
+      "",
+      `Likely newsletter: ${result.isLikelyNewsletter ? "YES" : "NO"}`,
+    ];
+
+    if (result.newsletterSignals.length > 0) {
+      lines.push("");
+      lines.push("Newsletter signals:");
+      result.newsletterSignals.forEach((s) => lines.push(`  - ${s}`));
+    }
+
+    lines.push("");
+    if (result.unsubscribeLinks.length === 0) {
+      lines.push("No unsubscribe links found in HTML body.");
+      lines.push("The email may use a mailto: link or a button not detectable by link regex.");
+    } else {
+      lines.push(`Unsubscribe link(s) found (${result.unsubscribeLinks.length}):`);
+      result.unsubscribeLinks.forEach((link, i) => lines.push(`  [${i + 1}] ${link}`));
+      lines.push("");
+      lines.push("Confirm with the user which link to use before opening.");
+    }
+
+    return successResponse(lines.join("\n"));
+  }, "Error analyzing unsubscribe links")
+);
+
+server.tool(
+  "draft-reply",
+  {
+    id: z.string().describe("Message ID of the email to reply to (any message in the thread)"),
+    draftBody: z
+      .string()
+      .optional()
+      .describe(
+        "Reply text to use as the draft body. If provided, creates a draft immediately. If omitted, returns thread context for you to compose the reply."
+      ),
+    maxMessages: z
+      .number()
+      .optional()
+      .describe("Max thread messages to include in context (default: 5, most recent)"),
+    bodyTruncate: z
+      .number()
+      .optional()
+      .describe("Max characters per message body in context (default: 500)"),
+    account: z
+      .string()
+      .optional()
+      .describe("Account to scope thread search to (omit to search all accounts)"),
+  },
+  withErrorHandling(({ id, draftBody, maxMessages = 5, bodyTruncate = 500, account }) => {
+    const { context, draftCreated } = mailManager.getDraftReplyContext(
+      id,
+      draftBody,
+      maxMessages,
+      bodyTruncate,
+      account
+    );
+
+    const lines: string[] = [];
+
+    if (draftBody !== undefined) {
+      lines.push(
+        draftCreated
+          ? `Draft reply created successfully. Review it in Mail.app before sending.`
+          : `Failed to create draft. Check that Mail.app has the message and that the recipient address is valid.`
+      );
+      lines.push("");
+    }
+
+    lines.push(context);
+
+    if (draftBody === undefined) {
+      lines.push("");
+      lines.push(
+        "To create the draft, call draft-reply again with the same id and your reply text in the draftBody parameter."
+      );
+    }
+
+    return successResponse(lines.join("\n"));
+  }, "Error preparing draft reply")
+);
+
+server.tool(
+  "summarize-thread",
+  {
+    id: z.string().describe("Message ID of any message in the thread to summarize"),
+    maxMessages: z
+      .number()
+      .optional()
+      .describe("Max thread messages to include (default: 20, most recent)"),
+    bodyTruncate: z.number().optional().describe("Max characters per message body (default: 1000)"),
+    account: z
+      .string()
+      .optional()
+      .describe("Account to scope thread search to (omit to search all accounts)"),
+  },
+  withErrorHandling(({ id, maxMessages = 20, bodyTruncate = 1000, account }) => {
+    const threadData = mailManager.getThreadSummaryData(id, maxMessages, bodyTruncate, account);
+
+    const lines: string[] = [
+      `Thread summary data for message ${id}`,
+      "",
+      "Summarize this thread in 3-5 sentences: current status, key decisions, and open questions.",
+      "═══════════════════════════════════════════════════════════════════════════════════════════",
+      "",
+      threadData,
+    ];
+
+    return successResponse(lines.join("\n"));
+  }, "Error summarizing thread")
+);
+
+server.tool(
+  "detect-waiting-for",
+  {
+    limit: z
+      .number()
+      .optional()
+      .describe(
+        "Max sent messages to check for replies (default: 20). Each check calls getThread — keep limit reasonable."
+      ),
+    daysAgo: z
+      .number()
+      .optional()
+      .describe(
+        "Only check messages sent at least this many days ago (default: 2 — ignore very recent sends)"
+      ),
+    account: z
+      .string()
+      .optional()
+      .describe("Account to scan Sent folder for (omit for default account)"),
+  },
+  withErrorHandling(({ limit = 20, daysAgo = 2, account }) => {
+    const items = mailManager.getWaitingFor(limit, daysAgo, account);
+
+    if (items.length === 0) {
+      return successResponse(
+        `No waiting-for items found. All sent messages in the last ${limit} (sent ${daysAgo}+ days ago) have received replies.`
+      );
+    }
+
+    const lines: string[] = [
+      `Waiting-for list: ${items.length} sent message(s) with no reply`,
+      "Sorted oldest first (most overdue at top)",
+      "═══════════════════════════════════════════",
+      "",
+    ];
+
+    items.forEach((item, i) => {
+      lines.push(`[${i + 1}] ID: ${item.id}`);
+      lines.push(`  Subject: ${item.subject}`);
+      lines.push(`  To: ${item.recipients.join(", ")}`);
+      lines.push(`  Sent: ${item.dateSent.toISOString().slice(0, 10)}`);
+      lines.push(`  Days waiting: ${item.daysWaiting}`);
+      lines.push("");
+    });
+
+    return successResponse(lines.join("\n"));
+  }, "Error detecting waiting-for items")
+);
+
+server.tool(
+  "get-config",
+  "Get the current persistent configuration for apple-mail-mcp (defaultAccount, defaultMailbox, timeoutMs). Returns {} if no config file exists yet.",
+  {},
+  withErrorHandling(() => {
+    const config = mailManager.getConfig();
+    return successResponse(JSON.stringify(config, null, 2));
+  }, "Error getting config")
+);
+
+server.tool(
+  "set-config",
+  "Update one or more persistent configuration values. Only provided fields are changed; omitted fields retain their current values.",
+  {
+    defaultAccount: z
+      .string()
+      .optional()
+      .describe("Default Mail account name to use when none is specified"),
+    defaultMailbox: z
+      .string()
+      .optional()
+      .describe("Default mailbox name (e.g. INBOX) to use when none is specified"),
+    timeoutMs: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe("AppleScript timeout in milliseconds (e.g. 60000)"),
+  },
+  withErrorHandling(({ defaultAccount, defaultMailbox, timeoutMs }) => {
+    mailManager.setConfig({ defaultAccount, defaultMailbox, timeoutMs });
+    const updated = mailManager.getConfig();
+    return successResponse(`Config updated:\n${JSON.stringify(updated, null, 2)}`);
+  }, "Error setting config")
 );
 
 // =============================================================================

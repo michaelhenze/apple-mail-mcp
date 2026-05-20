@@ -13,7 +13,12 @@
  * @module services/appleMailManager
  */
 
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
+import { execSync } from "child_process";
+import { homedir } from "os";
+import { join } from "path";
 import { executeAppleScript } from "@/utils/applescript.js";
+import { validateSavePath } from "@/utils/pathSecurity.js";
 import type {
   Message,
   MessageContent,
@@ -29,6 +34,10 @@ import type {
   MailRule,
   Contact,
   EmailTemplate,
+  ThreadMessage,
+  TriageMessage,
+  ActionItemsResult,
+  WaitingForItem,
 } from "@/types.js";
 
 // =============================================================================
@@ -103,6 +112,41 @@ const MAILBOX_ALIASES: Record<string, string[]> = {
   archive: ["Archive", "ARCHIVE", "archive", "All Mail"],
 };
 
+// Safe output delimiters — Unicode Private Use Area characters that cannot
+// appear in real email subjects, sender names, or mailbox names.
+// U+E001 = field separator (replaces pipe-pipe-pipe delimiter)
+// U+E002 = record separator (replaces pipe-pipe-pipe ITEM pipe-pipe-pipe delimiter)
+// U+E003 = content separator (replaces pipe-pipe-pipe CONTENT pipe-pipe-pipe in getMessageContent)
+// U+E004 = html separator (replaces pipe-pipe-pipe HTML pipe-pipe-pipe in getMessageContent)
+const FIELD_SEP = "";
+const RECORD_SEP = "";
+const CONTENT_SEP = "";
+const HTML_SEP = "";
+
+// =============================================================================
+// Subject Normalization
+// =============================================================================
+
+/**
+ * Strips common reply/forward subject prefixes to get the base subject.
+ *
+ * Handles English (Re:, Fwd:, FW:), German (AW:, WG:), and mixed-case variants.
+ * Applied recursively until no more prefixes remain.
+ *
+ * @param subject - Raw email subject line
+ * @returns Normalized base subject with prefixes stripped and whitespace trimmed
+ */
+export function normalizeSubject(subject: string): string {
+  const prefixPattern = /^(Re|RE|re|Fwd|FWD|fwd|FW|fw|AW|aw|WG|wg):\s+/;
+  let normalized = subject.trim();
+  let prev: string;
+  do {
+    prev = normalized;
+    normalized = normalized.replace(prefixPattern, "").trim();
+  } while (normalized !== prev);
+  return normalized;
+}
+
 // =============================================================================
 // Apple Mail Manager Class
 // =============================================================================
@@ -121,10 +165,25 @@ const MAILBOX_ALIASES: Record<string, string[]> = {
  * return null/false/empty-array on failure rather than throwing.
  */
 export class AppleMailManager {
+  private readonly TEMPLATE_FILE = join(homedir(), ".config", "apple-mail-mcp", "templates.json");
+  private readonly CONFIG_FILE = join(homedir(), ".config", "apple-mail-mcp", "config.json");
+
+  private config: {
+    defaultAccount?: string;
+    defaultMailbox?: string;
+    timeoutMs?: number;
+  } = {};
+
+  constructor() {
+    this.loadTemplates();
+    this.loadConfig();
+  }
+
   /**
    * Default account used when no account is specified.
+   * Stored with a 5-minute TTL so stale values are refreshed automatically.
    */
-  private defaultAccount: string | null = null;
+  private defaultAccountCache: { value: string; expiresAt: number } | null = null;
 
   /**
    * TTL cache for expensive AppleScript queries that rarely change.
@@ -134,10 +193,17 @@ export class AppleMailManager {
   private cache = {
     accounts: null as { data: Account[]; expiry: number } | null,
     mailboxNames: new Map<string, { data: string[]; expiry: number }>(),
+    messageLocations: new Map<string, { mailbox: string; account: string; expiry: number }>(),
   };
 
   /** Cache TTL in milliseconds (60 seconds). */
   private readonly CACHE_TTL_MS = 60_000;
+
+  /** TTL for the default account cache (5 minutes). */
+  private readonly DEFAULT_ACCOUNT_TTL_MS = 5 * 60_000;
+
+  /** TTL for the message location cache (5 minutes). */
+  private readonly MESSAGE_LOCATION_TTL_MS = 5 * 60_000;
 
   /**
    * Returns cached accounts or fetches fresh data if cache is expired/empty.
@@ -175,6 +241,32 @@ export class AppleMailManager {
   private invalidateCache(): void {
     this.cache.accounts = null;
     this.cache.mailboxNames.clear();
+    this.cache.messageLocations.clear();
+    this.defaultAccountCache = null;
+  }
+
+  /**
+   * Resolves a cached message location by ID.
+   * Returns null if not cached or TTL has expired.
+   */
+  private resolveMessageLocation(id: string): { mailbox: string; account: string } | null {
+    const now = Date.now();
+    const cached = this.cache.messageLocations.get(id);
+    if (cached && now < cached.expiry) {
+      return { mailbox: cached.mailbox, account: cached.account };
+    }
+    return null;
+  }
+
+  /**
+   * Stores a message's location in the cache with a TTL.
+   */
+  private cacheMessageLocation(id: string, mailbox: string, account: string): void {
+    this.cache.messageLocations.set(id, {
+      mailbox,
+      account,
+      expiry: Date.now() + this.MESSAGE_LOCATION_TTL_MS,
+    });
   }
 
   /**
@@ -184,7 +276,10 @@ export class AppleMailManager {
    */
   private resolveAccount(account?: string): string {
     if (account) return account;
-    if (this.defaultAccount) return this.defaultAccount;
+    const now = Date.now();
+    if (this.defaultAccountCache && now < this.defaultAccountCache.expiresAt) {
+      return this.defaultAccountCache.value;
+    }
 
     // Query Mail.app's default send account by inspecting a temporary outgoing message
     const defaultResult = executeAppleScript(
@@ -207,16 +302,22 @@ export class AppleMailManager {
         (a) => a.email.toLowerCase() === defaultEmail.toLowerCase()
       );
       if (matchedAccount) {
-        this.defaultAccount = matchedAccount.name;
-        return this.defaultAccount;
+        this.defaultAccountCache = {
+          value: matchedAccount.name,
+          expiresAt: Date.now() + this.DEFAULT_ACCOUNT_TTL_MS,
+        };
+        return this.defaultAccountCache!.value;
       }
     }
 
     // Fall back to first available account
     const accounts = this.getCachedAccounts();
     if (accounts.length > 0) {
-      this.defaultAccount = accounts[0].name;
-      return this.defaultAccount;
+      this.defaultAccountCache = {
+        value: accounts[0].name,
+        expiresAt: Date.now() + this.DEFAULT_ACCOUNT_TTL_MS,
+      };
+      return this.defaultAccountCache!.value;
     }
 
     return "iCloud"; // Last resort fallback
@@ -296,31 +397,60 @@ export class AppleMailManager {
     account?: string,
     limit = 50,
     dateFrom?: string,
-    dateTo?: string
+    dateTo?: string,
+    from?: string,
+    isRead?: boolean,
+    isFlagged?: boolean,
+    allMailboxes?: boolean,
+    offset = 0
   ): Message[] {
     // If no account specified, search across all accounts
     if (!account) {
       const accounts = this.listAccounts();
       const allMessages: Message[] = [];
       for (const acct of accounts) {
-        if (allMessages.length >= limit) break;
-        const remaining = limit - allMessages.length;
-        const msgs = this.searchMessages(query, mailbox, acct.name, remaining, dateFrom, dateTo);
+        if (allMessages.length >= offset + limit) break;
+        const remaining = offset + limit - allMessages.length;
+        const msgs = this.searchMessages(
+          query,
+          mailbox,
+          acct.name,
+          remaining,
+          dateFrom,
+          dateTo,
+          from,
+          isRead,
+          isFlagged,
+          allMailboxes,
+          0 // offset=0 per account; global slice below
+        );
         allMessages.push(...msgs);
       }
-      return allMessages.slice(0, limit);
+      return allMessages.slice(offset, offset + limit);
     }
 
     const targetAccount = this.resolveAccount(account);
-    const requestedMailbox = mailbox || "INBOX";
-    const targetMailbox = this.resolveMailbox(requestedMailbox, targetAccount);
 
-    // Build the search condition
-    let searchCondition = "";
+    // Build compound search conditions
+    const searchConditions: string[] = [];
+
     if (query) {
       const safeQuery = escapeForAppleScript(query);
-      searchCondition = `whose subject contains "${safeQuery}" or sender contains "${safeQuery}"`;
+      searchConditions.push(`(subject contains "${safeQuery}" or sender contains "${safeQuery}")`);
     }
+    if (from !== undefined) {
+      const safeFrom = escapeForAppleScript(from);
+      searchConditions.push(`sender contains "${safeFrom}"`);
+    }
+    if (isRead !== undefined) {
+      searchConditions.push(`read status is ${isRead}`);
+    }
+    if (isFlagged !== undefined) {
+      searchConditions.push(`flagged status is ${isFlagged}`);
+    }
+
+    const searchCondition =
+      searchConditions.length > 0 ? `whose (${searchConditions.join(" and ")})` : "";
 
     // Build date filter AppleScript
     let dateFilter = "";
@@ -335,24 +465,87 @@ export class AppleMailManager {
       dateFilter = dateChecks.join(" and ");
     }
 
+    if (allMailboxes) {
+      const searchCommand = `
+        set fieldSep to character id 57345
+        set recSep to character id 57346
+        set outputText to ""
+        set msgCount to 0
+        set skipped to 0
+        repeat with mb in mailboxes
+          set allMsgs to messages of mb ${searchCondition}
+          repeat with msg in allMsgs
+            if msgCount >= ${limit} then exit repeat
+            try
+              ${
+                dateFilter
+                  ? `set msgDate to date received of msg
+              if not (${dateFilter}) then
+              else`
+                  : ""
+              }
+              if skipped < ${offset} then
+                set skipped to skipped + 1
+              else
+                set msgId to id of msg as string
+                set msgSubject to subject of msg
+                set msgSender to sender of msg
+                set msgDateStr to date received of msg as string
+                set msgRead to read status of msg as string
+                set msgFlagged to flagged status of msg as string
+                set mbName to name of mb
+                if msgCount > 0 then set outputText to outputText & recSep
+                set outputText to outputText & msgId & fieldSep & msgSubject & fieldSep & msgSender & fieldSep & msgDateStr & fieldSep & msgRead & fieldSep & msgFlagged & fieldSep & mbName
+                set msgCount to msgCount + 1
+              end if
+              ${dateFilter ? "end if" : ""}
+            end try
+          end repeat
+          if msgCount >= ${limit} then exit repeat
+        end repeat
+        return outputText
+      `;
+      const script = buildAccountScopedScript(targetAccount, searchCommand);
+      const result = executeAppleScript(script, { timeoutMs: 60000 });
+      if (!result.success || !result.output.trim()) return [];
+      return this.parseMessageListAllMailboxes(result.output, targetAccount);
+    }
+
+    const requestedMailbox = mailbox || "INBOX";
+    const targetMailbox = this.resolveMailbox(requestedMailbox, targetAccount);
+
     const searchCommand = `
+      set fieldSep to character id 57345
+      set recSep to character id 57346
       set outputText to ""
       set theMailbox to mailbox "${escapeForAppleScript(targetMailbox)}"
       set allMessages to messages of theMailbox ${searchCondition}
       set msgCount to 0
+      set skipped to 0
       repeat with msg in allMessages
         if msgCount >= ${limit} then exit repeat
         try
-          ${dateFilter ? `set msgDate to date received of msg\n          if not (${dateFilter}) then\n            -- skip message outside date range\n          else` : ""}
-          set msgId to id of msg as string
-          set msgSubject to subject of msg
-          set msgSender to sender of msg
-          set msgDateStr to date received of msg as string
-          set msgRead to read status of msg as string
-          set msgFlagged to flagged status of msg as string
-          if msgCount > 0 then set outputText to outputText & "|||ITEM|||"
-          set outputText to outputText & msgId & "|||" & msgSubject & "|||" & msgSender & "|||" & msgDateStr & "|||" & msgRead & "|||" & msgFlagged
-          set msgCount to msgCount + 1
+          ${
+            dateFilter
+              ? `set msgDate to date received of msg
+          if not (${dateFilter}) then
+            -- skip message outside date range
+          else`
+              : ""
+          }
+          if skipped < ${offset} then
+            set skipped to skipped + 1
+          else
+            set msgId to id of msg as string
+            set msgSubject to subject of msg
+            set msgSender to sender of msg
+            set msgDateStr to date received of msg as string
+            set msgRead to read status of msg as string
+            set msgFlagged to flagged status of msg as string
+            if msgCount > 0 then set outputText to outputText & recSep
+            set outputText to outputText & msgId & fieldSep & msgSubject & fieldSep & msgSender & fieldSep & msgDateStr & fieldSep & msgRead & fieldSep & msgFlagged
+            set msgCount to msgCount + 1
+          end if
           ${dateFilter ? "end if" : ""}
         end try
       end repeat
@@ -379,8 +572,13 @@ export class AppleMailManager {
    * all mailboxes in all accounts to find the message.
    */
   getMessageById(id: string): Message | null {
+    if (!/^\d+$/.test(id)) {
+      console.error(`Invalid message ID: "${id}"`);
+      return null;
+    }
     const script = buildAppLevelScript(`
       try
+        set fieldSep to character id 57345
         repeat with acct in accounts
           repeat with mb in mailboxes of acct
             try
@@ -396,7 +594,40 @@ export class AppleMailManager {
                 set msgDeleted to deleted status of msg as string
                 set msgMailbox to name of mb
                 set msgAccount to name of acct
-                return msgSubject & "|||" & msgSender & "|||" & msgDate & "|||" & msgRead & "|||" & msgFlagged & "|||" & msgJunk & "|||" & msgDeleted & "|||" & msgMailbox & "|||" & msgAccount
+                -- recipients (field 10)
+                set msgRecipients to ""
+                try
+                  repeat with r in to recipients of msg
+                    if msgRecipients is not "" then set msgRecipients to msgRecipients & ","
+                    set msgRecipients to msgRecipients & (address of r)
+                  end repeat
+                end try
+                -- cc recipients (field 11)
+                set msgCC to ""
+                try
+                  repeat with r in cc recipients of msg
+                    if msgCC is not "" then set msgCC to msgCC & ","
+                    set msgCC to msgCC & (address of r)
+                  end repeat
+                end try
+                -- reply-to (field 12) — may not exist on all messages; wrap in try
+                set msgReplyTo to ""
+                try
+                  set msgReplyTo to reply to of msg
+                end try
+                -- has attachments (field 13)
+                set msgHasAtt to (count of mail attachments of msg) > 0
+                -- attachment names (field 14) — comma-joined
+                set msgAttNames to ""
+                if msgHasAtt then
+                  try
+                    repeat with att in mail attachments of msg
+                      if msgAttNames is not "" then set msgAttNames to msgAttNames & ","
+                      set msgAttNames to msgAttNames & (name of att)
+                    end repeat
+                  end try
+                end if
+                return msgSubject & fieldSep & msgSender & fieldSep & msgDate & fieldSep & msgRead & fieldSep & msgFlagged & fieldSep & msgJunk & fieldSep & msgDeleted & fieldSep & msgMailbox & fieldSep & msgAccount & fieldSep & msgRecipients & fieldSep & msgCC & fieldSep & msgReplyTo & fieldSep & (msgHasAtt as string) & fieldSep & msgAttNames
               end if
             end try
           end repeat
@@ -414,14 +645,21 @@ export class AppleMailManager {
       return null;
     }
 
-    const parts = result.output.split("|||");
+    const parts = result.output.split(FIELD_SEP);
     if (parts.length < 9) return null;
+
+    this.cacheMessageLocation(id, parts[7], parts[8]);
 
     return {
       id: id.toString(),
       subject: parts[0],
       sender: parts[1],
-      recipients: [],
+      senderName: parts[1].includes("<")
+        ? parts[1].split("<")[0].trim().replace(/^"/, "").replace(/"$/, "") || undefined
+        : undefined,
+      recipients: parts[9] ? parts[9].split(",").filter(Boolean) : [],
+      ccRecipients: parts[10] ? parts[10].split(",").filter(Boolean) : undefined,
+      replyTo: parts[11] || undefined,
       dateReceived: parseAppleScriptDate(parts[2]),
       isRead: parts[3] === "true",
       isFlagged: parts[4] === "true",
@@ -429,7 +667,8 @@ export class AppleMailManager {
       isDeleted: parts[6] === "true",
       mailbox: parts[7],
       account: parts[8],
-      hasAttachments: false,
+      hasAttachments: parts[12] === "true",
+      attachmentNames: parts[13] ? parts[13].split(",").filter(Boolean) : undefined,
     };
   }
 
@@ -437,8 +676,14 @@ export class AppleMailManager {
    * Get the content of a message.
    */
   getMessageContent(id: string): MessageContent | null {
+    if (!/^\d+$/.test(id)) {
+      console.error(`Invalid message ID: "${id}"`);
+      return null;
+    }
     const script = buildAppLevelScript(`
       try
+        set contentSep to character id 57347
+        set htmlSep to character id 57348
         repeat with acct in accounts
           repeat with mb in mailboxes of acct
             try
@@ -451,7 +696,7 @@ export class AppleMailManager {
                 try
                   set htmlContent to source of msg
                 end try
-                return msgSubject & "|||CONTENT|||" & msgContent & "|||HTML|||" & htmlContent
+                return msgSubject & contentSep & msgContent & htmlSep & htmlContent
               end if
             end try
           end repeat
@@ -469,11 +714,11 @@ export class AppleMailManager {
       return null;
     }
 
-    const htmlSplit = result.output.split("|||HTML|||");
+    const htmlSplit = result.output.split(HTML_SEP);
     const contentPart = htmlSplit[0];
     const htmlContent = htmlSplit.length > 1 ? htmlSplit[1] : undefined;
 
-    const parts = contentPart.split("|||CONTENT|||");
+    const parts = contentPart.split(CONTENT_SEP);
     if (parts.length < 2) return null;
 
     return {
@@ -497,16 +742,25 @@ export class AppleMailManager {
     account?: string,
     limit = 50,
     from?: string,
-    offset = 0
+    offset = 0,
+    unreadOnly?: boolean
   ): Message[] {
     const targetAccount = this.resolveAccount(account);
     const requestedMailbox = mailbox || "INBOX";
     const targetMailbox = this.resolveMailbox(requestedMailbox, targetAccount);
 
-    const safeFrom = from ? escapeForAppleScript(from) : "";
-    const fromFilter = from ? `whose sender contains "${safeFrom}"` : "";
+    const listConditions: string[] = [];
+    if (from) {
+      listConditions.push(`sender contains "${escapeForAppleScript(from)}"`);
+    }
+    if (unreadOnly) {
+      listConditions.push(`read status is false`);
+    }
+    const fromFilter = listConditions.length > 0 ? `whose (${listConditions.join(" and ")})` : "";
 
     const listCommand = `
+      set fieldSep to character id 57345
+      set recSep to character id 57346
       set outputText to ""
       set theMailbox to mailbox "${escapeForAppleScript(targetMailbox)}"
       set msgCount to 0
@@ -523,8 +777,8 @@ export class AppleMailManager {
             set msgDate to date received of msg as string
             set msgRead to read status of msg as string
             set msgFlagged to flagged status of msg as string
-            if msgCount > 0 then set outputText to outputText & "|||ITEM|||"
-            set outputText to outputText & msgId & "|||" & msgSubject & "|||" & msgSender & "|||" & msgDate & "|||" & msgRead & "|||" & msgFlagged
+            if msgCount > 0 then set outputText to outputText & recSep
+            set outputText to outputText & msgId & fieldSep & msgSubject & fieldSep & msgSender & fieldSep & msgDate & fieldSep & msgRead & fieldSep & msgFlagged
             set msgCount to msgCount + 1
           end if
         end try
@@ -549,15 +803,17 @@ export class AppleMailManager {
    * Parse message list output from AppleScript.
    */
   private parseMessageList(output: string, mailbox: string, account: string): Message[] {
-    const items = output.split("|||ITEM|||");
+    const items = output.split(RECORD_SEP);
     const messages: Message[] = [];
 
     for (const item of items) {
-      const parts = item.split("|||");
+      const parts = item.split(FIELD_SEP);
       if (parts.length < 6) continue;
 
+      const msgId = parts[0].trim();
+      this.cacheMessageLocation(msgId, mailbox, account);
       messages.push({
-        id: parts[0].trim(),
+        id: msgId,
         subject: parts[1],
         sender: parts[2],
         recipients: [],
@@ -567,6 +823,39 @@ export class AppleMailManager {
         isJunk: false,
         isDeleted: false,
         mailbox,
+        account,
+        hasAttachments: false,
+      });
+    }
+
+    return messages;
+  }
+
+  /**
+   * Parse message list from allMailboxes search output.
+   * Each record has 7 fields: id, subject, sender, date, read, flagged, mailbox
+   */
+  private parseMessageListAllMailboxes(output: string, account: string): Message[] {
+    const items = output.split(RECORD_SEP);
+    const messages: Message[] = [];
+
+    for (const item of items) {
+      const parts = item.split(FIELD_SEP);
+      if (parts.length < 7) continue;
+
+      const msgId = parts[0].trim();
+      this.cacheMessageLocation(msgId, parts[6], account);
+      messages.push({
+        id: msgId,
+        subject: parts[1],
+        sender: parts[2],
+        recipients: [],
+        dateReceived: parseAppleScriptDate(parts[3]),
+        isRead: parts[4] === "true",
+        isFlagged: parts[5] === "true",
+        isJunk: false,
+        isDeleted: false,
+        mailbox: parts[6],
         account,
         hasAttachments: false,
       });
@@ -592,10 +881,13 @@ export class AppleMailManager {
     body: string,
     cc?: string[],
     bcc?: string[],
-    account?: string
+    account?: string,
+    attachments?: string[],
+    isHtml?: boolean
   ): boolean {
     const safeSubject = escapeForAppleScript(subject);
     const safeBody = escapeForAppleScript(body);
+    const contentBody = isHtml ? escapeForAppleScript(body) : safeBody;
 
     // Build recipient additions
     let recipientCommands = "";
@@ -613,23 +905,58 @@ export class AppleMailManager {
       }
     }
 
+    // Build attachment additions
+    let attachmentCommands = "";
+    if (attachments) {
+      for (const filePath of attachments) {
+        const validatedFilePath = validateSavePath(filePath); // throws on traversal
+        const safePath = escapeForAppleScript(validatedFilePath);
+        attachmentCommands += `make new attachment with properties {file name:POSIX file "${safePath}"} at after the last paragraph\n`;
+      }
+    }
+
     let sendCommand: string;
     if (account) {
       const safeAccount = escapeForAppleScript(account);
-      sendCommand = `
+      sendCommand = isHtml
+        ? `
+        set newMessage to make new outgoing message with properties {subject:"${safeSubject}", visible:true}
+        tell newMessage
+          make new body part at beginning of body parts with properties {content:"${contentBody}", mime type:"text/html"}
+          ${recipientCommands}
+          set sender to "${safeAccount}"
+          ${attachmentCommands}
+        end tell
+        send newMessage
+        return "sent"
+      `
+        : `
         set newMessage to make new outgoing message with properties {subject:"${safeSubject}", content:"${safeBody}", visible:true}
         tell newMessage
           ${recipientCommands}
           set sender to "${safeAccount}"
+          ${attachmentCommands}
         end tell
         send newMessage
         return "sent"
       `;
     } else {
-      sendCommand = `
+      sendCommand = isHtml
+        ? `
+        set newMessage to make new outgoing message with properties {subject:"${safeSubject}", visible:true}
+        tell newMessage
+          make new body part at beginning of body parts with properties {content:"${contentBody}", mime type:"text/html"}
+          ${recipientCommands}
+          ${attachmentCommands}
+        end tell
+        send newMessage
+        return "sent"
+      `
+        : `
         set newMessage to make new outgoing message with properties {subject:"${safeSubject}", content:"${safeBody}", visible:true}
         tell newMessage
           ${recipientCommands}
+          ${attachmentCommands}
         end tell
         send newMessage
         return "sent"
@@ -664,10 +991,13 @@ export class AppleMailManager {
     body: string,
     cc?: string[],
     bcc?: string[],
-    account?: string
+    account?: string,
+    attachments?: string[],
+    isHtml?: boolean
   ): boolean {
     const safeSubject = escapeForAppleScript(subject);
     const safeBody = escapeForAppleScript(body);
+    const contentBody = isHtml ? escapeForAppleScript(body) : safeBody;
 
     // Build recipient additions
     let recipientCommands = "";
@@ -685,22 +1015,55 @@ export class AppleMailManager {
       }
     }
 
+    // Build attachment additions
+    let attachmentCommands = "";
+    if (attachments) {
+      for (const filePath of attachments) {
+        const validatedFilePath = validateSavePath(filePath); // throws on traversal
+        const safePath = escapeForAppleScript(validatedFilePath);
+        attachmentCommands += `make new attachment with properties {file name:POSIX file "${safePath}"} at after the last paragraph\n`;
+      }
+    }
+
     let draftCommand: string;
     if (account) {
       const safeAccount = escapeForAppleScript(account);
-      draftCommand = `
+      draftCommand = isHtml
+        ? `
+        set newMessage to make new outgoing message with properties {subject:"${safeSubject}", visible:false}
+        tell newMessage
+          make new body part at beginning of body parts with properties {content:"${contentBody}", mime type:"text/html"}
+          ${recipientCommands}
+          set sender to "${safeAccount}"
+          ${attachmentCommands}
+        end tell
+        return "draft created"
+      `
+        : `
         set newMessage to make new outgoing message with properties {subject:"${safeSubject}", content:"${safeBody}", visible:false}
         tell newMessage
           ${recipientCommands}
           set sender to "${safeAccount}"
+          ${attachmentCommands}
         end tell
         return "draft created"
       `;
     } else {
-      draftCommand = `
+      draftCommand = isHtml
+        ? `
+        set newMessage to make new outgoing message with properties {subject:"${safeSubject}", visible:false}
+        tell newMessage
+          make new body part at beginning of body parts with properties {content:"${contentBody}", mime type:"text/html"}
+          ${recipientCommands}
+          ${attachmentCommands}
+        end tell
+        return "draft created"
+      `
+        : `
         set newMessage to make new outgoing message with properties {subject:"${safeSubject}", content:"${safeBody}", visible:false}
         tell newMessage
           ${recipientCommands}
+          ${attachmentCommands}
         end tell
         return "draft created"
       `;
@@ -727,6 +1090,10 @@ export class AppleMailManager {
    * @returns true if reply created/sent successfully
    */
   replyToMessage(id: string, body: string, replyAll = false, send = true): boolean {
+    if (!/^\d+$/.test(id)) {
+      console.error(`Invalid message ID: "${id}"`);
+      return false;
+    }
     const safeBody = escapeForAppleScript(body);
     const replyAllClause = replyAll ? " with reply to all" : "";
     const sendAction = send ? "send theReply" : "";
@@ -773,6 +1140,10 @@ export class AppleMailManager {
    * @returns true if forward created/sent successfully
    */
   forwardMessage(id: string, to: string[], body?: string, send = true): boolean {
+    if (!/^\d+$/.test(id)) {
+      console.error(`Invalid message ID: "${id}"`);
+      return false;
+    }
     const safeBody = body ? escapeForAppleScript(body) : "";
     const sendAction = send ? "send theForward" : "";
 
@@ -817,8 +1188,54 @@ export class AppleMailManager {
 
   /**
    * Helper to find and operate on a message by ID.
+   *
+   * Cache fast-path: if the message location is cached, generates a targeted
+   * single-mailbox AppleScript instead of the O(accounts×mailboxes) nested loop.
+   * The targeted script includes an inline full-scan fallback so it handles stale
+   * cache entries (message moved externally) transparently in a single osascript call.
    */
   private findMessageScript(id: string, operation: string): string {
+    if (!/^\d+$/.test(id)) {
+      return buildAppLevelScript(`return "error:Invalid message ID"`);
+    }
+
+    const location = this.resolveMessageLocation(id);
+    if (location) {
+      // Cache HIT — target the known mailbox directly, then fall back to full scan
+      const safeMailbox = escapeForAppleScript(location.mailbox);
+      const safeAccount = escapeForAppleScript(location.account);
+      return buildAppLevelScript(`
+        try
+          set targetMb to mailbox "${safeMailbox}" of account "${safeAccount}"
+          set matchingMsgs to (messages of targetMb whose id is ${id})
+          if (count of matchingMsgs) > 0 then
+            set msg to item 1 of matchingMsgs
+            ${operation}
+            return "ok"
+          end if
+        end try
+        -- Cache stale or message moved: fall back to full scan
+        try
+          repeat with acct in accounts
+            repeat with mb in mailboxes of acct
+              try
+                set matchingMsgs to (messages of mb whose id is ${id})
+                if (count of matchingMsgs) > 0 then
+                  set msg to item 1 of matchingMsgs
+                  ${operation}
+                  return "ok"
+                end if
+              end try
+            end repeat
+          end repeat
+          return "error:Message not found"
+        on error errMsg
+          return "error:" & errMsg
+        end try
+      `);
+    }
+
+    // Cache MISS — use the full nested-loop scan
     return buildAppLevelScript(`
       try
         repeat with acct in accounts
@@ -901,6 +1318,64 @@ export class AppleMailManager {
   }
 
   /**
+   * Mark a message as junk and move it to the Junk mailbox.
+   *
+   * Sets `junk mail status` to true AND physically moves the message to
+   * the account's Junk mailbox (resolved via MAILBOX_ALIASES["junk"]).
+   * The move step is required because the AppleScript flag property alone
+   * does not move the message out of INBOX.
+   */
+  moveToJunk(id: string): boolean {
+    if (!/^\d+$/.test(id)) {
+      console.error(`Invalid message ID: "${id}"`);
+      return false;
+    }
+    // Step 1: set the junk flag. findMessageScript locates msg across all mailboxes.
+    const flagScript = this.findMessageScript(id, "set junk mail status of msg to true");
+    const flagResult = executeAppleScript(flagScript, { timeoutMs: 60000 });
+    if (!flagResult.success || flagResult.output.startsWith("error:")) {
+      console.error(`Failed to set junk flag: ${flagResult.error || flagResult.output}`);
+      return false;
+    }
+
+    // Step 2: move to junk mailbox. resolveAccount picks the message's account
+    // indirectly via moveMessage's own account resolution; "Junk" is in
+    // MAILBOX_ALIASES["junk"] so resolveMailbox will match it on all account types.
+    return this.moveMessage(id, "Junk");
+  }
+
+  /**
+   * Clear the junk flag on a message (flag-only; does not move message to INBOX).
+   *
+   * After calling this, the message remains in whatever mailbox it is in.
+   * Callers that want to restore the message to INBOX should also call
+   * moveMessage(id, "INBOX").
+   */
+  markAsNotJunk(id: string): boolean {
+    const script = this.findMessageScript(id, "set junk mail status of msg to false");
+    const result = executeAppleScript(script, { timeoutMs: 60000 });
+
+    if (!result.success || result.output.startsWith("error:")) {
+      console.error(`Failed to clear junk flag: ${result.error || result.output}`);
+      return false;
+    }
+
+    return true;
+  }
+
+  /**
+   * Archive a message by moving it to the account's Archive mailbox.
+   *
+   * The Archive mailbox name is resolved through MAILBOX_ALIASES["archive"],
+   * which includes "Archive", "ARCHIVE", "archive", "All Mail".
+   * Note: On Gmail accounts, this may leave the "Inbox" label on the message
+   * due to Gmail's IMAP label model. This is a known Gmail IMAP limitation.
+   */
+  archiveMessage(id: string, account?: string): boolean {
+    return this.moveMessage(id, "Archive", account);
+  }
+
+  /**
    * Delete a message.
    */
   deleteMessage(id: string): boolean {
@@ -912,6 +1387,7 @@ export class AppleMailManager {
       return false;
     }
 
+    this.cache.messageLocations.delete(id);
     return true;
   }
 
@@ -919,6 +1395,10 @@ export class AppleMailManager {
    * Move a message to a different mailbox.
    */
   moveMessage(id: string, mailbox: string, account?: string): boolean {
+    if (!/^\d+$/.test(id)) {
+      console.error(`Invalid message ID: "${id}"`);
+      return false;
+    }
     const targetAccount = this.resolveAccount(account);
     const targetMailbox = this.resolveMailbox(mailbox, targetAccount);
     const safeMailbox = escapeForAppleScript(targetMailbox);
@@ -952,6 +1432,7 @@ export class AppleMailManager {
       return false;
     }
 
+    this.cacheMessageLocation(id, targetMailbox, targetAccount);
     return true;
   }
 
@@ -1001,6 +1482,258 @@ export class AppleMailManager {
     }
 
     return results;
+  }
+
+  /**
+   * Archive multiple messages at once.
+   *
+   * @param ids - Array of message IDs to archive
+   * @param account - Account containing the Archive mailbox
+   * @returns Array of results for each message
+   */
+  batchArchiveMessages(ids: string[], account?: string): BatchOperationResult[] {
+    return this.batchMoveMessages(ids, "Archive", account);
+  }
+
+  /**
+   * Retrieve all messages in a thread by subject matching.
+   *
+   * Apple Mail's AppleScript API has no native thread/conversation object.
+   * This implementation finds the seed message's subject, normalizes it
+   * (strips Re:/Fwd: prefixes), then searches all mailboxes in all accounts
+   * for messages whose subject contains the base subject string.
+   *
+   * Results are sorted by dateReceived ascending.
+   *
+   * Limitations:
+   * - Very short base subjects (< 10 chars) may return unrelated messages.
+   *   getThread returns [] and logs a warning in that case.
+   * - Generic subjects ("Hello") may still produce false positives.
+   * - Gmail Archive label duplication does not affect this operation.
+   *
+   * @param id - ID of any message in the thread (the seed message)
+   * @param account - Optional: limit search to this account for performance
+   * @returns Thread messages ordered by dateReceived ascending, or [] on failure
+   */
+  getThread(id: string, account?: string): ThreadMessage[] {
+    if (!/^\d+$/.test(id)) {
+      console.error(`Invalid message ID: "${id}"`);
+      return [];
+    }
+
+    // Step 1: Fetch seed message to get subject
+    const seed = this.getMessageById(id);
+    if (!seed) {
+      console.error(`Thread seed message not found: ${id}`);
+      return [];
+    }
+
+    const baseSubject = normalizeSubject(seed.subject);
+
+    // Guard: subject too short → high false-positive risk
+    if (baseSubject.length < 10) {
+      console.warn(
+        `getThread: base subject "${baseSubject}" is shorter than 10 characters — search skipped to avoid false positives`
+      );
+      return [];
+    }
+
+    const safeSubject = escapeForAppleScript(baseSubject);
+
+    // Step 2: Build search script. If account is provided, limit to that account.
+    // Otherwise iterate all accounts.
+    let searchBody: string;
+    if (account) {
+      const safeAccount = escapeForAppleScript(account);
+      searchBody = `
+        set targetAcct to account "${safeAccount}"
+        repeat with mb in mailboxes of targetAcct
+          try
+            set matches to (messages of mb whose subject contains "${safeSubject}")
+            repeat with msg in matches
+              set msgId to id of msg as string
+              set msgSubj to subject of msg
+              set msgSender to sender of msg
+              set msgDate to date received of msg as string
+              set msgRead to read status of msg as string
+              set mbName to name of mb
+              set acctName to name of targetAcct
+              if msgCount > 0 then set outputText to outputText & recSep
+              set outputText to outputText & msgId & fieldSep & msgSubj & fieldSep & msgSender & fieldSep & msgDate & fieldSep & msgRead & fieldSep & mbName & fieldSep & acctName
+              set msgCount to msgCount + 1
+            end repeat
+          end try
+        end repeat
+      `;
+    } else {
+      searchBody = `
+        repeat with acct in accounts
+          repeat with mb in mailboxes of acct
+            try
+              set matches to (messages of mb whose subject contains "${safeSubject}")
+              repeat with msg in matches
+                set msgId to id of msg as string
+                set msgSubj to subject of msg
+                set msgSender to sender of msg
+                set msgDate to date received of msg as string
+                set msgRead to read status of msg as string
+                set mbName to name of mb
+                set acctName to name of acct
+                if msgCount > 0 then set outputText to outputText & recSep
+                set outputText to outputText & msgId & fieldSep & msgSubj & fieldSep & msgSender & fieldSep & msgDate & fieldSep & msgRead & fieldSep & mbName & fieldSep & acctName
+                set msgCount to msgCount + 1
+              end repeat
+            end try
+          end repeat
+        end repeat
+      `;
+    }
+
+    const script = buildAppLevelScript(`
+      set fieldSep to character id 57345
+      set recSep to character id 57346
+      set outputText to ""
+      set msgCount to 0
+      ${searchBody}
+      return outputText
+    `);
+
+    const result = executeAppleScript(script, { timeoutMs: 60000 });
+
+    if (!result.success || !result.output.trim()) {
+      return [];
+    }
+
+    // Parse the 7-field records produced by parseMessageListAllMailboxes format
+    // (id, subject, sender, dateReceived, isRead, mailbox, account)
+    const items = result.output.split(RECORD_SEP);
+    const messages: ThreadMessage[] = [];
+
+    for (const item of items) {
+      const parts = item.split(FIELD_SEP);
+      if (parts.length < 7) continue;
+      messages.push({
+        id: parts[0].trim(),
+        subject: parts[1],
+        sender: parts[2],
+        dateReceived: parseAppleScriptDate(parts[3]),
+        isRead: parts[4] === "true",
+        mailbox: parts[5],
+        account: parts[6],
+      });
+    }
+
+    // Sort by dateReceived ascending (oldest first)
+    messages.sort((a, b) => a.dateReceived.getTime() - b.dateReceived.getTime());
+
+    // Deduplicate by id (same message may appear in multiple mailboxes, e.g. Sent + INBOX for iCloud)
+    const seen = new Set<string>();
+    return messages.filter((m) => {
+      if (seen.has(m.id)) return false;
+      seen.add(m.id);
+      return true;
+    });
+  }
+
+  /**
+   * Retrieve messages from VIP senders configured in Mail.app.
+   *
+   * Apple Mail's AppleScript API does not expose VIP status as a message
+   * property or mailbox. VIP senders are stored in a plist file at
+   * ~/Library/Mail/V{version}/VIP.plist. This method:
+   *  1. Discovers the plist via `find ~/Library/Mail -name "VIP.plist" -maxdepth 3`
+   *  2. Converts it to JSON via `plutil -convert json -o -`
+   *  3. Extracts sender email addresses from EmailAddresses array
+   *  4. Searches INBOX for each VIP sender and merges results
+   *
+   * If no VIP.plist is found (no VIPs configured in Mail.app), returns
+   * an empty message list with an explanatory error string.
+   *
+   * @param limit - Max messages per VIP sender (default 50)
+   * @returns Object with messages array, vipSenders array, and optional error
+   */
+  getVipMessages(limit = 50): { messages: Message[]; vipSenders: string[]; error?: string } {
+    // Step 1: Discover VIP.plist path (macOS version-agnostic)
+    let plistPath: string;
+    try {
+      const findOutput = execSync("find ~/Library/Mail -name 'VIP.plist' -maxdepth 3 2>/dev/null", {
+        encoding: "utf8",
+        timeout: 5000,
+      }).trim();
+      if (!findOutput) {
+        return {
+          messages: [],
+          vipSenders: [],
+          error:
+            "No VIP senders found. Configure VIP senders in Mail.app (Mailbox > Add VIP) first.",
+        };
+      }
+      // Use the first result if multiple are found
+      plistPath = findOutput.split("\n")[0].trim();
+    } catch {
+      return {
+        messages: [],
+        vipSenders: [],
+        error: "Failed to locate VIP.plist. Ensure Mail.app is configured.",
+      };
+    }
+
+    // Step 2: Parse VIP plist as JSON via plutil (built-in macOS tool)
+    let vipSenders: string[] = [];
+    try {
+      const jsonOutput = execSync(`plutil -convert json -o - "${plistPath}"`, {
+        encoding: "utf8",
+        timeout: 5000,
+      });
+      const parsed = JSON.parse(jsonOutput) as Record<string, unknown>;
+      // VIP.plist structure: { EmailAddresses: ["addr1@example.com", ...] }
+      if (Array.isArray(parsed["EmailAddresses"])) {
+        vipSenders = (parsed["EmailAddresses"] as unknown[])
+          .filter((e): e is string => typeof e === "string" && e.includes("@"))
+          .map((e) => e.toLowerCase());
+      }
+    } catch {
+      return {
+        messages: [],
+        vipSenders: [],
+        error: "Failed to parse VIP.plist. The file may be malformed.",
+      };
+    }
+
+    if (vipSenders.length === 0) {
+      return {
+        messages: [],
+        vipSenders: [],
+        error: "VIP.plist found but contains no email addresses.",
+      };
+    }
+
+    // Step 3: Search INBOX for each VIP sender, merge and deduplicate
+    const seen = new Set<string>();
+    const allMessages: Message[] = [];
+
+    for (const sender of vipSenders) {
+      const results = this.searchMessages(
+        undefined,
+        "INBOX",
+        undefined,
+        limit,
+        undefined,
+        undefined,
+        sender
+      );
+      for (const msg of results) {
+        if (!seen.has(msg.id)) {
+          seen.add(msg.id);
+          allMessages.push(msg);
+        }
+      }
+    }
+
+    // Sort by dateReceived descending (newest first)
+    allMessages.sort((a, b) => b.dateReceived.getTime() - a.dateReceived.getTime());
+
+    return { messages: allMessages, vipSenders };
   }
 
   /**
@@ -1059,8 +1792,14 @@ export class AppleMailManager {
    * List attachments for a message.
    */
   listAttachments(id: string): Attachment[] {
+    if (!/^\d+$/.test(id)) {
+      console.error(`Invalid message ID: "${id}"`);
+      return [];
+    }
     const script = buildAppLevelScript(`
       try
+        set fieldSep to character id 57345
+        set recSep to character id 57346
         repeat with acct in accounts
           repeat with mb in mailboxes of acct
             try
@@ -1073,8 +1812,8 @@ export class AppleMailManager {
                   set attName to name of att
                   set attType to MIME type of att
                   set attSize to file size of att as string
-                  if attCount > 0 then set outputText to outputText & "|||ITEM|||"
-                  set outputText to outputText & attName & "|||" & attType & "|||" & attSize
+                  if attCount > 0 then set outputText to outputText & recSep
+                  set outputText to outputText & attName & fieldSep & attType & fieldSep & attSize
                   set attCount to attCount + 1
                 end repeat
                 return outputText
@@ -1094,11 +1833,11 @@ export class AppleMailManager {
       return [];
     }
 
-    const items = result.output.split("|||ITEM|||");
+    const items = result.output.split(RECORD_SEP);
     const attachments: Attachment[] = [];
 
     for (const item of items) {
-      const parts = item.split("|||");
+      const parts = item.split(FIELD_SEP);
       if (parts.length < 3) continue;
 
       attachments.push({
@@ -1115,9 +1854,45 @@ export class AppleMailManager {
   /**
    * Save an attachment from a message to disk.
    */
-  saveAttachment(id: string, attachmentName: string, savePath: string): boolean {
+  saveAttachment(
+    id: string,
+    attachmentName: string,
+    savePath: string,
+    attachmentIndex?: number
+  ): boolean {
+    if (!/^\d+$/.test(id)) {
+      console.error(`Invalid message ID: "${id}"`);
+      return false;
+    }
+    const validatedPath = validateSavePath(savePath); // throws on bad path
     const safeName = escapeForAppleScript(attachmentName);
-    const safePath = escapeForAppleScript(savePath);
+    const safePath = escapeForAppleScript(validatedPath);
+
+    const attachmentAccess =
+      attachmentIndex !== undefined
+        ? `
+                set msg to item 1 of matchingMsgs
+                set attCount to count of mail attachments of msg
+                if ${attachmentIndex} > attCount then
+                  return "error:Attachment index ${attachmentIndex} out of range (message has " & attCount & " attachment(s))"
+                end if
+                set att to mail attachment ${attachmentIndex} of msg
+                set attName to name of att
+                set attSavePath to POSIX file "${safePath}/" & attName
+                save att in attSavePath
+                return "ok"
+        `
+        : `
+                set msg to item 1 of matchingMsgs
+                repeat with att in mail attachments of msg
+                  if name of att is "${safeName}" then
+                    set attSavePath to POSIX file "${safePath}/${safeName}"
+                    save att in attSavePath
+                    return "ok"
+                  end if
+                end repeat
+                return "error:Attachment not found"
+        `;
 
     const script = buildAppLevelScript(`
       try
@@ -1126,15 +1901,7 @@ export class AppleMailManager {
             try
               set matchingMsgs to (messages of mb whose id is ${id})
               if (count of matchingMsgs) > 0 then
-                set msg to item 1 of matchingMsgs
-                repeat with att in mail attachments of msg
-                  if name of att is "${safeName}" then
-                    set savePath to POSIX file "${safePath}/${safeName}"
-                    save att in savePath
-                    return "ok"
-                  end if
-                end repeat
-                return "error:Attachment not found"
+                ${attachmentAccess}
               end if
             end try
           end repeat
@@ -1162,7 +1929,7 @@ export class AppleMailManager {
   /**
    * List all mailboxes for an account.
    */
-  listMailboxes(account?: string): Mailbox[] {
+  listMailboxes(account?: string, includeCount = true): Mailbox[] {
     const targetAccount = this.resolveAccount(account);
 
     const listCommand = `
@@ -1170,10 +1937,10 @@ export class AppleMailManager {
       repeat with mb in mailboxes
         set mbName to name of mb
         set mbUnread to unread count of mb
-        set mbCount to count of messages of mb
-        set end of mailboxList to mbName & "|||" & mbUnread & "|||" & mbCount
+        ${includeCount ? "set mbCount to count of messages of mb" : "set mbCount to 0"}
+        set end of mailboxList to mbName & (character id 57345) & mbUnread & (character id 57345) & mbCount
       end repeat
-      set AppleScript's text item delimiters to "|||ITEM|||"
+      set AppleScript's text item delimiters to (character id 57346)
       return mailboxList as text
     `;
 
@@ -1187,11 +1954,11 @@ export class AppleMailManager {
 
     if (!result.output.trim()) return [];
 
-    const items = result.output.split("|||ITEM|||");
+    const items = result.output.split(RECORD_SEP);
     const mailboxes: Mailbox[] = [];
 
     for (const item of items) {
-      const parts = item.split("|||");
+      const parts = item.split(FIELD_SEP);
       if (parts.length < 3) continue;
 
       mailboxes.push({
@@ -1331,6 +2098,12 @@ export class AppleMailManager {
 
     if (!result.success || result.output.startsWith("error:")) {
       console.error(`Failed to rename mailbox: ${result.error || result.output}`);
+      // ROLLBACK: Delete the new mailbox we just created to restore original state.
+      // Note: If the move loop ran partially before failing, some messages may exist
+      // in both mailboxes at this point. We delete the new mailbox only; the old
+      // mailbox retains its full original set. This is strictly better than leaving
+      // an empty new mailbox orphaned.
+      this.deleteMailbox(newName, targetAccount);
       return false;
     }
 
@@ -1364,9 +2137,9 @@ export class AppleMailManager {
         if (count of acctEmail) > 0 then
           set emailStr to item 1 of acctEmail
         end if
-        set end of accountList to acctName & "|||" & emailStr & "|||" & acctEnabled
+        set end of accountList to acctName & (character id 57345) & emailStr & (character id 57345) & acctEnabled
       end repeat
-      set AppleScript's text item delimiters to "|||ITEM|||"
+      set AppleScript's text item delimiters to (character id 57346)
       return accountList as text
     `);
 
@@ -1379,11 +2152,11 @@ export class AppleMailManager {
 
     if (!result.output.trim()) return [];
 
-    const items = result.output.split("|||ITEM|||");
+    const items = result.output.split(RECORD_SEP);
     const accounts: Account[] = [];
 
     for (const item of items) {
-      const parts = item.split("|||");
+      const parts = item.split(FIELD_SEP);
       if (parts.length < 3) continue;
 
       accounts.push({
@@ -1433,9 +2206,9 @@ export class AppleMailManager {
       repeat with r in rules
         set ruleName to name of r
         set ruleEnabled to enabled of r
-        set end of ruleList to ruleName & "|||" & (ruleEnabled as string)
+        set end of ruleList to ruleName & (character id 57345) & (ruleEnabled as string)
       end repeat
-      set AppleScript's text item delimiters to "|||ITEM|||"
+      set AppleScript's text item delimiters to (character id 57346)
       return ruleList as text
     `);
 
@@ -1445,11 +2218,11 @@ export class AppleMailManager {
       return [];
     }
 
-    const items = result.output.split("|||ITEM|||");
+    const items = result.output.split(RECORD_SEP);
     const rules: MailRule[] = [];
 
     for (const item of items) {
-      const parts = item.split("|||");
+      const parts = item.split(FIELD_SEP);
       if (parts.length < 2) continue;
       rules.push({
         name: parts[0],
@@ -1522,11 +2295,11 @@ export class AppleMailManager {
               if pPhones is not "" then set pPhones to pPhones & ","
               set pPhones to pPhones & (value of ph)
             end repeat
-            set end of matchedContacts to pName & "|||" & pEmails & "|||" & pPhones
+            set end of matchedContacts to pName & (character id 57345) & pEmails & (character id 57345) & pPhones
           end if
         end repeat
 
-        set AppleScript's text item delimiters to "|||ITEM|||"
+        set AppleScript's text item delimiters to (character id 57346)
         return matchedContacts as text
       end tell
     `;
@@ -1537,11 +2310,11 @@ export class AppleMailManager {
       return [];
     }
 
-    const items = result.output.split("|||ITEM|||");
+    const items = result.output.split(RECORD_SEP);
     const contacts: Contact[] = [];
 
     for (const item of items) {
-      const parts = item.split("|||");
+      const parts = item.split(FIELD_SEP);
       if (parts.length < 3) continue;
       contacts.push({
         name: parts[0],
@@ -1588,6 +2361,7 @@ export class AppleMailManager {
     const templateId = id || `tmpl_${this.nextTemplateId++}`;
     const template: EmailTemplate = { id: templateId, name, subject, body, to, cc };
     this.templates.set(templateId, template);
+    this.persistTemplates();
     return template;
   }
 
@@ -1595,7 +2369,87 @@ export class AppleMailManager {
    * Delete a template.
    */
   deleteTemplate(id: string): boolean {
-    return this.templates.delete(id);
+    const deleted = this.templates.delete(id);
+    if (deleted) this.persistTemplates();
+    return deleted;
+  }
+
+  /**
+   * Load templates from disk. Called in constructor.
+   */
+  private loadTemplates(): void {
+    try {
+      if (!existsSync(this.TEMPLATE_FILE)) return;
+      const raw = readFileSync(this.TEMPLATE_FILE, "utf8");
+      const data = JSON.parse(raw) as {
+        nextId: number;
+        templates: Record<string, EmailTemplate>;
+      };
+      this.templates = new Map(Object.entries(data.templates));
+      this.nextTemplateId = data.nextId;
+    } catch (err) {
+      // Corrupt or unreadable — start fresh, do not crash
+      console.error(`[apple-mail-mcp] Failed to load templates: ${err}`);
+    }
+  }
+
+  /**
+   * Persist templates to disk.
+   */
+  private persistTemplates(): void {
+    try {
+      const dir = join(homedir(), ".config", "apple-mail-mcp");
+      if (!existsSync(dir)) {
+        mkdirSync(dir, { recursive: true });
+      }
+      const data = {
+        nextId: this.nextTemplateId,
+        templates: Object.fromEntries(this.templates),
+      };
+      writeFileSync(this.TEMPLATE_FILE, JSON.stringify(data, null, 2), "utf8");
+    } catch (err) {
+      console.error(`[apple-mail-mcp] Failed to persist templates: ${err}`);
+    }
+  }
+
+  private loadConfig(): void {
+    try {
+      if (!existsSync(this.CONFIG_FILE)) return;
+      const raw = readFileSync(this.CONFIG_FILE, "utf8");
+      this.config = JSON.parse(raw) as typeof this.config;
+      // Seed the TTL cache from config as a preference hint
+      if (this.config.defaultAccount) {
+        this.defaultAccountCache = {
+          value: this.config.defaultAccount,
+          expiresAt: Date.now() + this.DEFAULT_ACCOUNT_TTL_MS,
+        };
+      }
+    } catch (err) {
+      console.error(`[apple-mail-mcp] Failed to load config: ${err}`);
+    }
+  }
+
+  private persistConfig(): void {
+    try {
+      const dir = join(homedir(), ".config", "apple-mail-mcp");
+      if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+      writeFileSync(this.CONFIG_FILE, JSON.stringify(this.config, null, 2), "utf8");
+    } catch (err) {
+      console.error(`[apple-mail-mcp] Failed to persist config: ${err}`);
+    }
+  }
+
+  getConfig(): { defaultAccount?: string; defaultMailbox?: string; timeoutMs?: number } {
+    return { ...this.config };
+  }
+
+  setConfig(partial: {
+    defaultAccount?: string;
+    defaultMailbox?: string;
+    timeoutMs?: number;
+  }): void {
+    this.config = { ...this.config, ...partial };
+    this.persistConfig();
   }
 
   /**
@@ -1690,7 +2544,7 @@ export class AppleMailManager {
     }
 
     // Check 4: Basic operations work
-    const mailboxes = this.listMailboxes(accounts[0].name);
+    const mailboxes = this.listMailboxes(accounts[0].name, false);
     checks.push({
       name: "operations",
       passed: true,
@@ -1809,7 +2663,7 @@ export class AppleMailManager {
         end try
       end repeat
 
-      return (last24h as string) & "|||" & (last7d as string) & "|||" & (last30d as string)
+      return (last24h as string) & (character id 57345) & (last7d as string) & (character id 57345) & (last30d as string)
     `);
 
     const result = executeAppleScript(script, { timeoutMs: 60000 });
@@ -1819,7 +2673,7 @@ export class AppleMailManager {
       return { last24h: 0, last7d: 0, last30d: 0 };
     }
 
-    const parts = result.output.split("|||");
+    const parts = result.output.split(FIELD_SEP);
     if (parts.length < 3) {
       return { last24h: 0, last7d: 0, last30d: 0 };
     }
@@ -1832,76 +2686,340 @@ export class AppleMailManager {
   }
 
   /**
-   * Get sync status for Mail.app.
+   * Check whether Mail.app is running and how many accounts are loaded.
    *
-   * Checks for sync activity indicators like:
-   * - Activity monitor status
-   * - Network activity status
-   * - Background refresh indicators
-   *
-   * @returns Sync status information
+   * Note: Apple Mail's AppleScript API does not expose IMAP sync state,
+   * pending upload counts, or last-sync timestamps. This method reports
+   * only what is directly observable.
    */
   getSyncStatus(): SyncStatus {
-    // Check for Mail.app background activity and sync status
-    // Mail.app doesn't expose sync status directly through AppleScript,
-    // so we check for recent changes and activity indicators
     const script = buildAppLevelScript(`
-      set syncInfo to ""
-
-      -- Check if Mail.app is running
-      tell application "System Events"
-        set mailRunning to (name of processes) contains "Mail"
-      end tell
-
-      if not mailRunning then
-        return "not_running"
-      end if
-
-      -- Check for background activity by looking at message counts changing
-      -- This is a proxy for sync activity since Mail doesn't expose sync status
       set accountCount to count of accounts
-      set totalMailboxes to 0
-      repeat with acct in accounts
-        set totalMailboxes to totalMailboxes + (count of mailboxes of acct)
-      end repeat
-
-      return "running|||" & accountCount & "|||" & totalMailboxes
+      return "running" & (character id 57345) & accountCount
     `);
 
     const result = executeAppleScript(script);
 
     if (!result.success) {
       return {
-        syncDetected: false,
-        pendingUpload: 0,
-        recentActivity: false,
-        secondsSinceLastChange: -1,
-        error: result.error,
+        running: false,
+        accountCount: 0,
+        error: result.error ?? "AppleScript execution failed",
       };
     }
 
-    if (result.output === "not_running") {
-      return {
-        syncDetected: false,
-        pendingUpload: 0,
-        recentActivity: false,
-        secondsSinceLastChange: -1,
-        error: "Mail.app is not running",
-      };
-    }
-
-    // Parse the response
-    const parts = result.output.split("|||");
-    const isRunning = parts[0] === "running";
+    // Mail.app not running: osascript returns an error, caught above.
+    // If we reach here, Mail.app responded — it is running.
+    const parts = result.output.split(FIELD_SEP);
     const accountCount = parseInt(parts[1]) || 0;
 
-    // Mail.app is running with accounts configured - assume sync is active
-    // (Mail.app syncs automatically when running)
     return {
-      syncDetected: isRunning && accountCount > 0,
-      pendingUpload: 0, // Not exposed by Mail.app
-      recentActivity: isRunning,
-      secondsSinceLastChange: 0,
+      running: true,
+      accountCount,
     };
+  }
+
+  // ===========================================================================
+  // Phase 4: Intelligence Layer
+  // ===========================================================================
+
+  getTriageMessages(
+    mailbox = "INBOX",
+    limit = 20,
+    includeSnippets = true,
+    account?: string
+  ): TriageMessage[] {
+    const messages = this.listMessages(mailbox, account, limit, undefined, 0, true);
+    return messages.map((msg) => {
+      const entry: TriageMessage = {
+        id: msg.id,
+        subject: msg.subject,
+        sender: msg.sender,
+        dateReceived: msg.dateReceived,
+        isRead: msg.isRead,
+        isFlagged: msg.isFlagged,
+        hasAttachments: msg.hasAttachments,
+        mailbox: msg.mailbox,
+        account: msg.account,
+      };
+      if (includeSnippets) {
+        const content = this.getMessageContent(msg.id);
+        if (content) {
+          entry.snippet = content.plainText.slice(0, 200).replace(/\n+/g, " ").trim();
+        }
+      }
+      return entry;
+    });
+  }
+
+  getSummarizeInboxData(
+    mailbox = "INBOX",
+    limit = 30,
+    account?: string
+  ): { totalUnread: number; messages: Message[] } {
+    const totalUnread = this.getUnreadCount(mailbox, account);
+    const messages = this.listMessages(mailbox, account, limit, undefined, 0, true);
+    return { totalUnread, messages };
+  }
+
+  getActionItems(
+    id?: string,
+    mailbox = "INBOX",
+    limit = 10,
+    account?: string
+  ): ActionItemsResult[] {
+    if (id) {
+      if (!/^\d+$/.test(id)) {
+        console.error(`Invalid message ID: "${id}"`);
+        return [];
+      }
+      const msg = this.getMessageById(id);
+      if (!msg) return [];
+      const content = this.getMessageContent(id);
+      if (!content) return [];
+      return [
+        {
+          id: msg.id,
+          subject: msg.subject,
+          sender: msg.sender,
+          dateReceived: msg.dateReceived,
+          plainText: content.plainText,
+        },
+      ];
+    }
+    const messages = this.listMessages(mailbox, account, limit);
+    const results: ActionItemsResult[] = [];
+    for (const msg of messages) {
+      const content = this.getMessageContent(msg.id);
+      if (content) {
+        results.push({
+          id: msg.id,
+          subject: msg.subject,
+          sender: msg.sender,
+          dateReceived: msg.dateReceived,
+          plainText: content.plainText,
+        });
+      }
+    }
+    return results;
+  }
+
+  getUnsubscribeLinks(id: string): {
+    isLikelyNewsletter: boolean;
+    newsletterSignals: string[];
+    unsubscribeLinks: string[];
+  } {
+    if (!/^\d+$/.test(id)) {
+      console.error(`Invalid message ID: "${id}"`);
+      return { isLikelyNewsletter: false, newsletterSignals: [], unsubscribeLinks: [] };
+    }
+    const content = this.getMessageContent(id);
+    if (!content) {
+      return { isLikelyNewsletter: false, newsletterSignals: [], unsubscribeLinks: [] };
+    }
+
+    const html = content.htmlContent ?? "";
+    const links: string[] = [];
+
+    // Pass 1: links where anchor text contains unsubscribe/optout/opt-out/remove
+    const textPattern =
+      /<a[^>]+href=["']([^"']+)["'][^>]*>[^<]*(?:unsubscribe|opt.out|remove)[^<]*<\/a>/gi;
+    // Pass 2: links where href itself contains those keywords
+    const hrefPattern = /href=["']([^"']*(?:unsubscribe|optout|opt-out|remove)[^"']*)/gi;
+
+    let match: RegExpExecArray | null;
+    while ((match = textPattern.exec(html)) !== null) {
+      if (!links.includes(match[1])) links.push(match[1]);
+    }
+    while ((match = hrefPattern.exec(html)) !== null) {
+      if (!links.includes(match[1])) links.push(match[1]);
+    }
+
+    // Newsletter heuristics
+    const signals: string[] = [];
+    const msg = this.getMessageById(id);
+    if (msg) {
+      const lcSender = msg.sender.toLowerCase();
+      const lcSubject = msg.subject.toLowerCase();
+      if (
+        /mailchimp|substack|constantcontact|campaignmonitor|sendgrid|klaviyo|hubspot/.test(lcSender)
+      ) {
+        signals.push("Known newsletter sender domain");
+      }
+      if (/list-unsubscribe/i.test(html)) {
+        signals.push("Contains List-Unsubscribe header in source");
+      }
+      if (/weekly|digest|newsletter|update|bulletin/i.test(lcSubject)) {
+        signals.push("Subject contains newsletter keywords");
+      }
+      if (links.length > 0) {
+        signals.push("Unsubscribe link found in HTML");
+      }
+    }
+
+    return {
+      isLikelyNewsletter: signals.length >= 2,
+      newsletterSignals: signals,
+      unsubscribeLinks: links,
+    };
+  }
+
+  getDraftReplyContext(
+    id: string,
+    draftBody?: string,
+    maxMessages = 5,
+    bodyTruncate = 500,
+    account?: string
+  ): { context: string; draftCreated?: boolean } {
+    if (!/^\d+$/.test(id)) {
+      console.error(`Invalid message ID: "${id}"`);
+      return { context: "Error: Invalid message ID." };
+    }
+
+    const seed = this.getMessageById(id);
+    if (!seed) {
+      return { context: "Error: Message not found." };
+    }
+
+    const thread = this.getThread(id, account);
+    const relevant = thread.length > 0 ? thread.slice(-maxMessages) : [];
+
+    const lines: string[] = [];
+    lines.push(`Thread context for reply (${relevant.length} message(s)):`);
+    lines.push("");
+
+    if (relevant.length === 0) {
+      // Fallback: show seed message only
+      const content = this.getMessageContent(id);
+      lines.push(
+        `[Message] From: ${seed.sender} | ${seed.dateReceived.toISOString().slice(0, 10)}`
+      );
+      lines.push(`Subject: ${seed.subject}`);
+      lines.push("---");
+      lines.push(content ? content.plainText.slice(0, bodyTruncate) : "(body unavailable)");
+    } else {
+      for (let i = 0; i < relevant.length; i++) {
+        const tm = relevant[i];
+        const label = i === 0 ? "Original" : `Message ${i + 1}`;
+        const content = this.getMessageContent(tm.id);
+        lines.push(`[${label}] From: ${tm.sender} | ${tm.dateReceived.toISOString().slice(0, 10)}`);
+        lines.push(`Subject: ${tm.subject}`);
+        lines.push("---");
+        lines.push(content ? content.plainText.slice(0, bodyTruncate) : "(body unavailable)");
+        lines.push("");
+      }
+    }
+
+    let draftCreated: boolean | undefined;
+    if (draftBody !== undefined && seed.recipients.length > 0) {
+      const replyTo = seed.replyTo ?? seed.sender;
+      draftCreated = this.createDraft(
+        [replyTo],
+        `Re: ${normalizeSubject(seed.subject)}`,
+        draftBody
+      );
+    }
+
+    return { context: lines.join("\n"), draftCreated };
+  }
+
+  getThreadSummaryData(
+    id: string,
+    maxMessages = 20,
+    bodyTruncate = 1000,
+    account?: string
+  ): string {
+    if (!/^\d+$/.test(id)) {
+      console.error(`Invalid message ID: "${id}"`);
+      return "Error: Invalid message ID.";
+    }
+
+    const thread = this.getThread(id, account);
+    if (thread.length === 0) {
+      const seed = this.getMessageById(id);
+      if (!seed) return "Error: Message not found.";
+      const content = this.getMessageContent(id);
+      return [
+        `Thread data (1 message — subject too short for thread search or no thread found):`,
+        "",
+        `[Message] From: ${seed.sender} | ${seed.dateReceived.toISOString().slice(0, 10)}`,
+        `Subject: ${seed.subject}`,
+        "---",
+        content ? content.plainText.slice(0, bodyTruncate) : "(body unavailable)",
+      ].join("\n");
+    }
+
+    const relevant = thread.slice(-maxMessages);
+    const lines: string[] = [`Thread data (${relevant.length} message(s)):`, ""];
+
+    for (let i = 0; i < relevant.length; i++) {
+      const tm = relevant[i];
+      const content = this.getMessageContent(tm.id);
+      lines.push(`[${i + 1}] From: ${tm.sender} | ${tm.dateReceived.toISOString().slice(0, 10)}`);
+      lines.push(`Subject: ${tm.subject}`);
+      lines.push("---");
+      lines.push(content ? content.plainText.slice(0, bodyTruncate) : "(body unavailable)");
+      lines.push("");
+    }
+
+    return lines.join("\n");
+  }
+
+  getWaitingFor(limit = 20, daysAgo = 2, account?: string): WaitingForItem[] {
+    // Build set of user's own email addresses
+    const accounts = this.listAccounts();
+    const userEmails = new Set(accounts.map((a) => a.email.toLowerCase()));
+
+    // Fetch recent sent messages
+    const sentMessages = this.searchMessages(
+      undefined,
+      "Sent",
+      account,
+      limit + 20, // fetch extra to account for daysAgo filtering
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      false,
+      0
+    );
+
+    const now = new Date();
+    const thresholdMs = daysAgo * 24 * 60 * 60 * 1000;
+
+    const waiting: WaitingForItem[] = [];
+
+    for (const msg of sentMessages) {
+      if (waiting.length >= limit) break;
+
+      // Only consider messages older than daysAgo threshold
+      const age = now.getTime() - msg.dateReceived.getTime();
+      if (age < thresholdMs) continue;
+
+      // Check for replies via thread
+      const thread = this.getThread(msg.id, account);
+      const hasReply = thread.some(
+        (tm) =>
+          !userEmails.has(tm.sender.toLowerCase()) &&
+          tm.dateReceived.getTime() > msg.dateReceived.getTime()
+      );
+
+      if (!hasReply) {
+        waiting.push({
+          id: msg.id,
+          subject: msg.subject,
+          sender: msg.sender,
+          recipients: msg.recipients,
+          dateSent: msg.dateReceived, // dateReceived on sent messages = when sent
+          daysWaiting: Math.floor(age / (24 * 60 * 60 * 1000)),
+          hasReply: false,
+        });
+      }
+    }
+
+    // Sort oldest first (most overdue)
+    waiting.sort((a, b) => a.dateSent.getTime() - b.dateSent.getTime());
+    return waiting;
   }
 }

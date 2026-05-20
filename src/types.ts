@@ -37,6 +37,9 @@ export interface Message {
   /** CC recipients */
   ccRecipients?: string[];
 
+  /** Reply-to address (if different from sender) */
+  replyTo?: string;
+
   /** BCC recipients (only available for sent mail) */
   bccRecipients?: string[];
 
@@ -66,6 +69,36 @@ export interface Message {
 
   /** Whether the message has attachments */
   hasAttachments: boolean;
+
+  /** Names of attachments on this message */
+  attachmentNames?: string[];
+}
+
+/**
+ * A message in an email thread, returned by get-thread.
+ * Subset of Message with fields sufficient for thread display.
+ */
+export interface ThreadMessage {
+  /** Unique identifier for the message */
+  id: string;
+
+  /** Subject line */
+  subject: string;
+
+  /** Sender email address */
+  sender: string;
+
+  /** Date received */
+  dateReceived: Date;
+
+  /** Whether the message has been read */
+  isRead: boolean;
+
+  /** Mailbox containing the message */
+  mailbox: string;
+
+  /** Account containing the message */
+  account: string;
 }
 
 /**
@@ -467,21 +500,52 @@ export interface EmailTemplate {
 // =============================================================================
 
 /**
- * Status of Mail.app sync activity.
+ * Status of Mail.app — whether it is running and how many accounts are loaded.
+ * Note: Apple Mail's AppleScript API does not expose IMAP sync state, pending
+ * upload counts, or last-sync timestamps. Only observable facts are reported.
  */
 export interface SyncStatus {
-  /** Whether sync activity was detected */
-  syncDetected: boolean;
+  /** Whether Mail.app is currently running */
+  running: boolean;
 
-  /** Number of items pending upload */
-  pendingUpload: number;
+  /** Number of accounts loaded in Mail.app */
+  accountCount: number;
 
-  /** Whether there was recent database activity */
-  recentActivity: boolean;
-
-  /** Seconds since last database change */
-  secondsSinceLastChange: number;
-
-  /** Error message if status check failed */
+  /** Error message if the status check failed */
   error?: string;
+}
+
+// =============================================================================
+// Phase 4: Intelligence Layer
+// =============================================================================
+
+export interface TriageMessage {
+  id: string;
+  subject: string;
+  sender: string;
+  dateReceived: Date;
+  isRead: boolean;
+  isFlagged: boolean;
+  hasAttachments: boolean;
+  mailbox: string;
+  account: string;
+  snippet?: string; // first ~200 chars of plainText; undefined when includeSnippets=false
+}
+
+export interface ActionItemsResult {
+  id: string;
+  subject: string;
+  sender: string;
+  dateReceived: Date;
+  plainText: string;
+}
+
+export interface WaitingForItem {
+  id: string;
+  subject: string;
+  sender: string; // always the user's own address
+  recipients: string[];
+  dateSent: Date;
+  daysWaiting: number; // Math.floor((now - dateSent) / 86400000)
+  hasReply: boolean; // always false — only items with hasReply=false are returned
 }
