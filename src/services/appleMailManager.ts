@@ -14,6 +14,7 @@
  */
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
+import { execSync } from "child_process";
 import { homedir } from "os";
 import { join } from "path";
 import { executeAppleScript } from "@/utils/applescript.js";
@@ -33,6 +34,7 @@ import type {
   MailRule,
   Contact,
   EmailTemplate,
+  ThreadMessage,
 } from "@/types.js";
 
 // =============================================================================
@@ -117,6 +119,30 @@ const FIELD_SEP = "";
 const RECORD_SEP = "";
 const CONTENT_SEP = "";
 const HTML_SEP = "";
+
+// =============================================================================
+// Subject Normalization
+// =============================================================================
+
+/**
+ * Strips common reply/forward subject prefixes to get the base subject.
+ *
+ * Handles English (Re:, Fwd:, FW:), German (AW:, WG:), and mixed-case variants.
+ * Applied recursively until no more prefixes remain.
+ *
+ * @param subject - Raw email subject line
+ * @returns Normalized base subject with prefixes stripped and whitespace trimmed
+ */
+export function normalizeSubject(subject: string): string {
+  const prefixPattern = /^(Re|RE|re|Fwd|FWD|fwd|FW|fw|AW|aw|WG|wg):\s+/;
+  let normalized = subject.trim();
+  let prev: string;
+  do {
+    prev = normalized;
+    normalized = normalized.replace(prefixPattern, "").trim();
+  } while (normalized !== prev);
+  return normalized;
+}
 
 // =============================================================================
 // Apple Mail Manager Class
@@ -1189,6 +1215,64 @@ export class AppleMailManager {
   }
 
   /**
+   * Mark a message as junk and move it to the Junk mailbox.
+   *
+   * Sets `junk mail status` to true AND physically moves the message to
+   * the account's Junk mailbox (resolved via MAILBOX_ALIASES["junk"]).
+   * The move step is required because the AppleScript flag property alone
+   * does not move the message out of INBOX.
+   */
+  moveToJunk(id: string): boolean {
+    if (!/^\d+$/.test(id)) {
+      console.error(`Invalid message ID: "${id}"`);
+      return false;
+    }
+    // Step 1: set the junk flag. findMessageScript locates msg across all mailboxes.
+    const flagScript = this.findMessageScript(id, "set junk mail status of msg to true");
+    const flagResult = executeAppleScript(flagScript, { timeoutMs: 60000 });
+    if (!flagResult.success || flagResult.output.startsWith("error:")) {
+      console.error(`Failed to set junk flag: ${flagResult.error || flagResult.output}`);
+      return false;
+    }
+
+    // Step 2: move to junk mailbox. resolveAccount picks the message's account
+    // indirectly via moveMessage's own account resolution; "Junk" is in
+    // MAILBOX_ALIASES["junk"] so resolveMailbox will match it on all account types.
+    return this.moveMessage(id, "Junk");
+  }
+
+  /**
+   * Clear the junk flag on a message (flag-only; does not move message to INBOX).
+   *
+   * After calling this, the message remains in whatever mailbox it is in.
+   * Callers that want to restore the message to INBOX should also call
+   * moveMessage(id, "INBOX").
+   */
+  markAsNotJunk(id: string): boolean {
+    const script = this.findMessageScript(id, "set junk mail status of msg to false");
+    const result = executeAppleScript(script, { timeoutMs: 60000 });
+
+    if (!result.success || result.output.startsWith("error:")) {
+      console.error(`Failed to clear junk flag: ${result.error || result.output}`);
+      return false;
+    }
+
+    return true;
+  }
+
+  /**
+   * Archive a message by moving it to the account's Archive mailbox.
+   *
+   * The Archive mailbox name is resolved through MAILBOX_ALIASES["archive"],
+   * which includes "Archive", "ARCHIVE", "archive", "All Mail".
+   * Note: On Gmail accounts, this may leave the "Inbox" label on the message
+   * due to Gmail's IMAP label model. This is a known Gmail IMAP limitation.
+   */
+  archiveMessage(id: string, account?: string): boolean {
+    return this.moveMessage(id, "Archive", account);
+  }
+
+  /**
    * Delete a message.
    */
   deleteMessage(id: string): boolean {
@@ -1293,6 +1377,258 @@ export class AppleMailManager {
     }
 
     return results;
+  }
+
+  /**
+   * Archive multiple messages at once.
+   *
+   * @param ids - Array of message IDs to archive
+   * @param account - Account containing the Archive mailbox
+   * @returns Array of results for each message
+   */
+  batchArchiveMessages(ids: string[], account?: string): BatchOperationResult[] {
+    return this.batchMoveMessages(ids, "Archive", account);
+  }
+
+  /**
+   * Retrieve all messages in a thread by subject matching.
+   *
+   * Apple Mail's AppleScript API has no native thread/conversation object.
+   * This implementation finds the seed message's subject, normalizes it
+   * (strips Re:/Fwd: prefixes), then searches all mailboxes in all accounts
+   * for messages whose subject contains the base subject string.
+   *
+   * Results are sorted by dateReceived ascending.
+   *
+   * Limitations:
+   * - Very short base subjects (< 10 chars) may return unrelated messages.
+   *   getThread returns [] and logs a warning in that case.
+   * - Generic subjects ("Hello") may still produce false positives.
+   * - Gmail Archive label duplication does not affect this operation.
+   *
+   * @param id - ID of any message in the thread (the seed message)
+   * @param account - Optional: limit search to this account for performance
+   * @returns Thread messages ordered by dateReceived ascending, or [] on failure
+   */
+  getThread(id: string, account?: string): ThreadMessage[] {
+    if (!/^\d+$/.test(id)) {
+      console.error(`Invalid message ID: "${id}"`);
+      return [];
+    }
+
+    // Step 1: Fetch seed message to get subject
+    const seed = this.getMessageById(id);
+    if (!seed) {
+      console.error(`Thread seed message not found: ${id}`);
+      return [];
+    }
+
+    const baseSubject = normalizeSubject(seed.subject);
+
+    // Guard: subject too short → high false-positive risk
+    if (baseSubject.length < 10) {
+      console.warn(
+        `getThread: base subject "${baseSubject}" is shorter than 10 characters — search skipped to avoid false positives`
+      );
+      return [];
+    }
+
+    const safeSubject = escapeForAppleScript(baseSubject);
+
+    // Step 2: Build search script. If account is provided, limit to that account.
+    // Otherwise iterate all accounts.
+    let searchBody: string;
+    if (account) {
+      const safeAccount = escapeForAppleScript(account);
+      searchBody = `
+        set targetAcct to account "${safeAccount}"
+        repeat with mb in mailboxes of targetAcct
+          try
+            set matches to (messages of mb whose subject contains "${safeSubject}")
+            repeat with msg in matches
+              set msgId to id of msg as string
+              set msgSubj to subject of msg
+              set msgSender to sender of msg
+              set msgDate to date received of msg as string
+              set msgRead to read status of msg as string
+              set mbName to name of mb
+              set acctName to name of targetAcct
+              if msgCount > 0 then set outputText to outputText & recSep
+              set outputText to outputText & msgId & fieldSep & msgSubj & fieldSep & msgSender & fieldSep & msgDate & fieldSep & msgRead & fieldSep & mbName & fieldSep & acctName
+              set msgCount to msgCount + 1
+            end repeat
+          end try
+        end repeat
+      `;
+    } else {
+      searchBody = `
+        repeat with acct in accounts
+          repeat with mb in mailboxes of acct
+            try
+              set matches to (messages of mb whose subject contains "${safeSubject}")
+              repeat with msg in matches
+                set msgId to id of msg as string
+                set msgSubj to subject of msg
+                set msgSender to sender of msg
+                set msgDate to date received of msg as string
+                set msgRead to read status of msg as string
+                set mbName to name of mb
+                set acctName to name of acct
+                if msgCount > 0 then set outputText to outputText & recSep
+                set outputText to outputText & msgId & fieldSep & msgSubj & fieldSep & msgSender & fieldSep & msgDate & fieldSep & msgRead & fieldSep & mbName & fieldSep & acctName
+                set msgCount to msgCount + 1
+              end repeat
+            end try
+          end repeat
+        end repeat
+      `;
+    }
+
+    const script = buildAppLevelScript(`
+      set fieldSep to character id 57345
+      set recSep to character id 57346
+      set outputText to ""
+      set msgCount to 0
+      ${searchBody}
+      return outputText
+    `);
+
+    const result = executeAppleScript(script, { timeoutMs: 60000 });
+
+    if (!result.success || !result.output.trim()) {
+      return [];
+    }
+
+    // Parse the 7-field records produced by parseMessageListAllMailboxes format
+    // (id, subject, sender, dateReceived, isRead, mailbox, account)
+    const items = result.output.split(RECORD_SEP);
+    const messages: ThreadMessage[] = [];
+
+    for (const item of items) {
+      const parts = item.split(FIELD_SEP);
+      if (parts.length < 7) continue;
+      messages.push({
+        id: parts[0].trim(),
+        subject: parts[1],
+        sender: parts[2],
+        dateReceived: parseAppleScriptDate(parts[3]),
+        isRead: parts[4] === "true",
+        mailbox: parts[5],
+        account: parts[6],
+      });
+    }
+
+    // Sort by dateReceived ascending (oldest first)
+    messages.sort((a, b) => a.dateReceived.getTime() - b.dateReceived.getTime());
+
+    // Deduplicate by id (same message may appear in multiple mailboxes, e.g. Sent + INBOX for iCloud)
+    const seen = new Set<string>();
+    return messages.filter((m) => {
+      if (seen.has(m.id)) return false;
+      seen.add(m.id);
+      return true;
+    });
+  }
+
+  /**
+   * Retrieve messages from VIP senders configured in Mail.app.
+   *
+   * Apple Mail's AppleScript API does not expose VIP status as a message
+   * property or mailbox. VIP senders are stored in a plist file at
+   * ~/Library/Mail/V{version}/VIP.plist. This method:
+   *  1. Discovers the plist via `find ~/Library/Mail -name "VIP.plist" -maxdepth 3`
+   *  2. Converts it to JSON via `plutil -convert json -o -`
+   *  3. Extracts sender email addresses from EmailAddresses array
+   *  4. Searches INBOX for each VIP sender and merges results
+   *
+   * If no VIP.plist is found (no VIPs configured in Mail.app), returns
+   * an empty message list with an explanatory error string.
+   *
+   * @param limit - Max messages per VIP sender (default 50)
+   * @returns Object with messages array, vipSenders array, and optional error
+   */
+  getVipMessages(limit = 50): { messages: Message[]; vipSenders: string[]; error?: string } {
+    // Step 1: Discover VIP.plist path (macOS version-agnostic)
+    let plistPath: string;
+    try {
+      const findOutput = execSync("find ~/Library/Mail -name 'VIP.plist' -maxdepth 3 2>/dev/null", {
+        encoding: "utf8",
+        timeout: 5000,
+      }).trim();
+      if (!findOutput) {
+        return {
+          messages: [],
+          vipSenders: [],
+          error:
+            "No VIP senders found. Configure VIP senders in Mail.app (Mailbox > Add VIP) first.",
+        };
+      }
+      // Use the first result if multiple are found
+      plistPath = findOutput.split("\n")[0].trim();
+    } catch {
+      return {
+        messages: [],
+        vipSenders: [],
+        error: "Failed to locate VIP.plist. Ensure Mail.app is configured.",
+      };
+    }
+
+    // Step 2: Parse VIP plist as JSON via plutil (built-in macOS tool)
+    let vipSenders: string[] = [];
+    try {
+      const jsonOutput = execSync(`plutil -convert json -o - "${plistPath}"`, {
+        encoding: "utf8",
+        timeout: 5000,
+      });
+      const parsed = JSON.parse(jsonOutput) as Record<string, unknown>;
+      // VIP.plist structure: { EmailAddresses: ["addr1@example.com", ...] }
+      if (Array.isArray(parsed["EmailAddresses"])) {
+        vipSenders = (parsed["EmailAddresses"] as unknown[])
+          .filter((e): e is string => typeof e === "string" && e.includes("@"))
+          .map((e) => e.toLowerCase());
+      }
+    } catch {
+      return {
+        messages: [],
+        vipSenders: [],
+        error: "Failed to parse VIP.plist. The file may be malformed.",
+      };
+    }
+
+    if (vipSenders.length === 0) {
+      return {
+        messages: [],
+        vipSenders: [],
+        error: "VIP.plist found but contains no email addresses.",
+      };
+    }
+
+    // Step 3: Search INBOX for each VIP sender, merge and deduplicate
+    const seen = new Set<string>();
+    const allMessages: Message[] = [];
+
+    for (const sender of vipSenders) {
+      const results = this.searchMessages(
+        undefined,
+        "INBOX",
+        undefined,
+        limit,
+        undefined,
+        undefined,
+        sender
+      );
+      for (const msg of results) {
+        if (!seen.has(msg.id)) {
+          seen.add(msg.id);
+          allMessages.push(msg);
+        }
+      }
+    }
+
+    // Sort by dateReceived descending (newest first)
+    allMessages.sort((a, b) => b.dateReceived.getTime() - a.dateReceived.getTime());
+
+    return { messages: allMessages, vipSenders };
   }
 
   /**
@@ -2205,76 +2541,36 @@ export class AppleMailManager {
   }
 
   /**
-   * Get sync status for Mail.app.
+   * Check whether Mail.app is running and how many accounts are loaded.
    *
-   * Checks for sync activity indicators like:
-   * - Activity monitor status
-   * - Network activity status
-   * - Background refresh indicators
-   *
-   * @returns Sync status information
+   * Note: Apple Mail's AppleScript API does not expose IMAP sync state,
+   * pending upload counts, or last-sync timestamps. This method reports
+   * only what is directly observable.
    */
   getSyncStatus(): SyncStatus {
-    // Check for Mail.app background activity and sync status
-    // Mail.app doesn't expose sync status directly through AppleScript,
-    // so we check for recent changes and activity indicators
     const script = buildAppLevelScript(`
-      set syncInfo to ""
-
-      -- Check if Mail.app is running
-      tell application "System Events"
-        set mailRunning to (name of processes) contains "Mail"
-      end tell
-
-      if not mailRunning then
-        return "not_running"
-      end if
-
-      -- Check for background activity by looking at message counts changing
-      -- This is a proxy for sync activity since Mail doesn't expose sync status
       set accountCount to count of accounts
-      set totalMailboxes to 0
-      repeat with acct in accounts
-        set totalMailboxes to totalMailboxes + (count of mailboxes of acct)
-      end repeat
-
-      return "running" & (character id 57345) & accountCount & (character id 57345) & totalMailboxes
+      return "running" & (character id 57345) & accountCount
     `);
 
     const result = executeAppleScript(script);
 
     if (!result.success) {
       return {
-        syncDetected: false,
-        pendingUpload: 0,
-        recentActivity: false,
-        secondsSinceLastChange: -1,
-        error: result.error,
+        running: false,
+        accountCount: 0,
+        error: result.error ?? "AppleScript execution failed",
       };
     }
 
-    if (result.output === "not_running") {
-      return {
-        syncDetected: false,
-        pendingUpload: 0,
-        recentActivity: false,
-        secondsSinceLastChange: -1,
-        error: "Mail.app is not running",
-      };
-    }
-
-    // Parse the response
+    // Mail.app not running: osascript returns an error, caught above.
+    // If we reach here, Mail.app responded — it is running.
     const parts = result.output.split(FIELD_SEP);
-    const isRunning = parts[0] === "running";
     const accountCount = parseInt(parts[1]) || 0;
 
-    // Mail.app is running with accounts configured - assume sync is active
-    // (Mail.app syncs automatically when running)
     return {
-      syncDetected: isRunning && accountCount > 0,
-      pendingUpload: 0, // Not exposed by Mail.app
-      recentActivity: isRunning,
-      secondsSinceLastChange: 0,
+      running: true,
+      accountCount,
     };
   }
 }
