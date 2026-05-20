@@ -514,3 +514,38 @@ export interface SyncStatus {
   /** Error message if the status check failed */
   error?: string;
 }
+
+// =============================================================================
+// Phase 4: Intelligence Layer
+// =============================================================================
+
+export interface TriageMessage {
+  id: string;
+  subject: string;
+  sender: string;
+  dateReceived: Date;
+  isRead: boolean;
+  isFlagged: boolean;
+  hasAttachments: boolean;
+  mailbox: string;
+  account: string;
+  snippet?: string; // first ~200 chars of plainText; undefined when includeSnippets=false
+}
+
+export interface ActionItemsResult {
+  id: string;
+  subject: string;
+  sender: string;
+  dateReceived: Date;
+  plainText: string;
+}
+
+export interface WaitingForItem {
+  id: string;
+  subject: string;
+  sender: string; // always the user's own address
+  recipients: string[];
+  dateSent: Date;
+  daysWaiting: number; // Math.floor((now - dateSent) / 86400000)
+  hasReply: boolean; // always false — only items with hasReply=false are returned
+}
