@@ -966,6 +966,202 @@ server.tool(
 );
 
 // =============================================================================
+// Junk Mail Tools
+// =============================================================================
+
+// --- move-to-junk ---
+
+server.tool(
+  "move-to-junk",
+  {
+    id: z
+      .string()
+      .regex(/^\d+$/, "Message ID must be numeric")
+      .describe("Unique message ID (from list-messages or search-messages)"),
+  },
+  withErrorHandling(({ id }) => {
+    const success = mailManager.moveToJunk(id);
+    if (!success) {
+      return errorResponse(
+        `Failed to mark message "${id}" as junk. The message may not exist or the Junk mailbox may be unavailable.`
+      );
+    }
+    return successResponse(`Message "${id}" marked as junk and moved to Junk mailbox.`);
+  }, "Error marking message as junk")
+);
+
+// --- mark-as-not-junk ---
+
+server.tool(
+  "mark-as-not-junk",
+  {
+    id: z
+      .string()
+      .regex(/^\d+$/, "Message ID must be numeric")
+      .describe("Unique message ID (from list-messages or search-messages)"),
+  },
+  withErrorHandling(({ id }) => {
+    const success = mailManager.markAsNotJunk(id);
+    if (!success) {
+      return errorResponse(
+        `Failed to clear junk flag on message "${id}". The message may not exist.`
+      );
+    }
+    return successResponse(
+      `Message "${id}" junk flag cleared. The message remains in its current mailbox — use move-message to restore it to INBOX if needed.`
+    );
+  }, "Error clearing junk flag")
+);
+
+// =============================================================================
+// Archive Tools
+// =============================================================================
+
+// --- archive-message ---
+
+server.tool(
+  "archive-message",
+  {
+    id: z
+      .string()
+      .regex(/^\d+$/, "Message ID must be numeric")
+      .describe("Unique message ID (from list-messages or search-messages)"),
+    account: z
+      .string()
+      .optional()
+      .describe("Account whose Archive mailbox to use (omit to use default account)"),
+  },
+  withErrorHandling(({ id, account }) => {
+    const success = mailManager.archiveMessage(id, account);
+    if (!success) {
+      return errorResponse(
+        `Failed to archive message "${id}". The Archive mailbox may be unavailable for this account.`
+      );
+    }
+    return successResponse(
+      `Message "${id}" archived. Note: Gmail accounts may leave the Inbox label due to Gmail's IMAP label model.`
+    );
+  }, "Error archiving message")
+);
+
+// --- batch-archive ---
+
+server.tool(
+  "batch-archive",
+  {
+    ids: z
+      .array(z.string().regex(/^\d+$/, "Message ID must be numeric"))
+      .min(1, "At least one message ID required")
+      .describe("Array of message IDs to archive"),
+    account: z
+      .string()
+      .optional()
+      .describe("Account whose Archive mailbox to use (omit to use default account)"),
+  },
+  withErrorHandling(({ ids, account }) => {
+    const results = mailManager.batchArchiveMessages(ids, account);
+    const succeeded = results.filter((r) => r.success).length;
+    const failed = results.filter((r) => !r.success);
+
+    const lines: string[] = [`Archived ${succeeded}/${results.length} messages.`];
+    if (failed.length > 0) {
+      lines.push(`Failed: ${failed.map((r) => r.id).join(", ")}`);
+    }
+
+    return successResponse(lines.join("\n"));
+  }, "Error batch archiving messages")
+);
+
+// =============================================================================
+// Thread Tools
+// =============================================================================
+
+// --- get-thread ---
+
+server.tool(
+  "get-thread",
+  {
+    id: z
+      .string()
+      .regex(/^\d+$/, "Message ID must be numeric")
+      .describe("ID of any message in the thread (seed message)"),
+    account: z
+      .string()
+      .optional()
+      .describe(
+        "Limit thread search to this account (faster). Omit to search all accounts (slower, more complete)."
+      ),
+  },
+  withErrorHandling(({ id, account }) => {
+    const messages = mailManager.getThread(id, account);
+
+    if (messages.length === 0) {
+      return successResponse(
+        `No thread found for message "${id}". The subject may be too short or the message may not exist.`
+      );
+    }
+
+    const lines: string[] = [
+      `Thread: ${messages.length} message${messages.length === 1 ? "" : "s"} (oldest first)`,
+      ``,
+    ];
+
+    for (let i = 0; i < messages.length; i++) {
+      const m = messages[i];
+      const dateStr = m.dateReceived.toLocaleString();
+      const readStatus = m.isRead ? "Read" : "Unread";
+      lines.push(`[${i + 1}] ID: ${m.id}  ${readStatus}`);
+      lines.push(`    From: ${m.sender}`);
+      lines.push(`    Subject: ${m.subject}`);
+      lines.push(`    Date: ${dateStr}`);
+      lines.push(`    Mailbox: ${m.mailbox} (${m.account})`);
+      lines.push(``);
+    }
+
+    return successResponse(lines.join("\n").trimEnd());
+  }, "Error getting thread")
+);
+
+// =============================================================================
+// VIP Tools
+// =============================================================================
+
+// --- get-vip-messages ---
+
+server.tool(
+  "get-vip-messages",
+  {
+    limit: z.number().optional().describe("Max messages per VIP sender to retrieve (default: 50)"),
+  },
+  withErrorHandling(({ limit }) => {
+    const { messages, vipSenders, error } = mailManager.getVipMessages(limit ?? 50);
+
+    if (error && messages.length === 0) {
+      return successResponse(`VIP messages: none\n\n${error}`);
+    }
+
+    const lines: string[] = [
+      `VIP Senders (${vipSenders.length}): ${vipSenders.join(", ")}`,
+      `Messages from VIP senders: ${messages.length}`,
+      ``,
+    ];
+
+    for (const m of messages) {
+      const dateStr = m.dateReceived.toLocaleString();
+      const readStatus = m.isRead ? "Read" : "Unread";
+      lines.push(`ID: ${m.id}  [${readStatus}]`);
+      lines.push(`  From: ${m.sender}`);
+      lines.push(`  Subject: ${m.subject}`);
+      lines.push(`  Date: ${dateStr}`);
+      lines.push(`  Mailbox: ${m.mailbox}`);
+      lines.push(``);
+    }
+
+    return successResponse(lines.join("\n").trimEnd());
+  }, "Error getting VIP messages")
+);
+
+// =============================================================================
 // Diagnostics Tools
 // =============================================================================
 
@@ -1036,14 +1232,18 @@ server.tool(
     const status = mailManager.getSyncStatus();
 
     const lines: string[] = [];
-    lines.push(`🔄 Mail Sync Status`);
+    lines.push(`Mail Sync Status`);
     lines.push(`═══════════════════`);
 
     if (status.error) {
-      lines.push(`Status: ⚠️ ${status.error}`);
+      lines.push(`Status: ${status.error}`);
     } else {
-      lines.push(`Mail.app: ${status.recentActivity ? "Running" : "Not running"}`);
-      lines.push(`Sync active: ${status.syncDetected ? "Yes" : "No"}`);
+      lines.push(`Mail.app: ${status.running ? "Running" : "Not running"}`);
+      lines.push(`Accounts loaded: ${status.accountCount}`);
+      lines.push(``);
+      lines.push(
+        `Note: Apple Mail does not expose IMAP sync state via AppleScript. Only running status and account count are observable.`
+      );
     }
 
     return successResponse(lines.join("\n"));
