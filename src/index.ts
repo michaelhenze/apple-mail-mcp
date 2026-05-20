@@ -115,6 +115,10 @@ server.tool(
       .describe(
         "Search across all mailboxes in the account (not just INBOX). May be slow on large mail stores."
       ),
+    offset: z
+      .number()
+      .optional()
+      .describe("Number of results to skip (for pagination, default: 0)"),
   },
   withErrorHandling(
     ({
@@ -125,6 +129,7 @@ server.tool(
       mailbox,
       account,
       limit = 50,
+      offset = 0,
       dateFrom,
       dateTo,
       allMailboxes,
@@ -139,7 +144,8 @@ server.tool(
         from,
         isRead,
         isFlagged,
-        allMailboxes
+        allMailboxes,
+        offset
       );
 
       if (messages.length === 0) {

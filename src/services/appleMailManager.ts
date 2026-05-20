@@ -312,15 +312,16 @@ export class AppleMailManager {
     from?: string,
     isRead?: boolean,
     isFlagged?: boolean,
-    allMailboxes?: boolean
+    allMailboxes?: boolean,
+    offset = 0
   ): Message[] {
     // If no account specified, search across all accounts
     if (!account) {
       const accounts = this.listAccounts();
       const allMessages: Message[] = [];
       for (const acct of accounts) {
-        if (allMessages.length >= limit) break;
-        const remaining = limit - allMessages.length;
+        if (allMessages.length >= offset + limit) break;
+        const remaining = offset + limit - allMessages.length;
         const msgs = this.searchMessages(
           query,
           mailbox,
@@ -331,11 +332,12 @@ export class AppleMailManager {
           from,
           isRead,
           isFlagged,
-          allMailboxes
+          allMailboxes,
+          0 // offset=0 per account; global slice below
         );
         allMessages.push(...msgs);
       }
-      return allMessages.slice(0, limit);
+      return allMessages.slice(offset, offset + limit);
     }
 
     const targetAccount = this.resolveAccount(account);
@@ -380,22 +382,33 @@ export class AppleMailManager {
         set recSep to character id 57346
         set outputText to ""
         set msgCount to 0
+        set skipped to 0
         repeat with mb in mailboxes
           set allMsgs to messages of mb ${searchCondition}
           repeat with msg in allMsgs
             if msgCount >= ${limit} then exit repeat
             try
-              ${dateFilter ? `set msgDate to date received of msg\n              if not (${dateFilter}) then\n              else` : ""}
-              set msgId to id of msg as string
-              set msgSubject to subject of msg
-              set msgSender to sender of msg
-              set msgDateStr to date received of msg as string
-              set msgRead to read status of msg as string
-              set msgFlagged to flagged status of msg as string
-              set mbName to name of mb
-              if msgCount > 0 then set outputText to outputText & recSep
-              set outputText to outputText & msgId & fieldSep & msgSubject & fieldSep & msgSender & fieldSep & msgDateStr & fieldSep & msgRead & fieldSep & msgFlagged & fieldSep & mbName
-              set msgCount to msgCount + 1
+              ${
+                dateFilter
+                  ? `set msgDate to date received of msg
+              if not (${dateFilter}) then
+              else`
+                  : ""
+              }
+              if skipped < ${offset} then
+                set skipped to skipped + 1
+              else
+                set msgId to id of msg as string
+                set msgSubject to subject of msg
+                set msgSender to sender of msg
+                set msgDateStr to date received of msg as string
+                set msgRead to read status of msg as string
+                set msgFlagged to flagged status of msg as string
+                set mbName to name of mb
+                if msgCount > 0 then set outputText to outputText & recSep
+                set outputText to outputText & msgId & fieldSep & msgSubject & fieldSep & msgSender & fieldSep & msgDateStr & fieldSep & msgRead & fieldSep & msgFlagged & fieldSep & mbName
+                set msgCount to msgCount + 1
+              end if
               ${dateFilter ? "end if" : ""}
             end try
           end repeat
@@ -419,19 +432,31 @@ export class AppleMailManager {
       set theMailbox to mailbox "${escapeForAppleScript(targetMailbox)}"
       set allMessages to messages of theMailbox ${searchCondition}
       set msgCount to 0
+      set skipped to 0
       repeat with msg in allMessages
         if msgCount >= ${limit} then exit repeat
         try
-          ${dateFilter ? `set msgDate to date received of msg\n          if not (${dateFilter}) then\n            -- skip message outside date range\n          else` : ""}
-          set msgId to id of msg as string
-          set msgSubject to subject of msg
-          set msgSender to sender of msg
-          set msgDateStr to date received of msg as string
-          set msgRead to read status of msg as string
-          set msgFlagged to flagged status of msg as string
-          if msgCount > 0 then set outputText to outputText & recSep
-          set outputText to outputText & msgId & fieldSep & msgSubject & fieldSep & msgSender & fieldSep & msgDateStr & fieldSep & msgRead & fieldSep & msgFlagged
-          set msgCount to msgCount + 1
+          ${
+            dateFilter
+              ? `set msgDate to date received of msg
+          if not (${dateFilter}) then
+            -- skip message outside date range
+          else`
+              : ""
+          }
+          if skipped < ${offset} then
+            set skipped to skipped + 1
+          else
+            set msgId to id of msg as string
+            set msgSubject to subject of msg
+            set msgSender to sender of msg
+            set msgDateStr to date received of msg as string
+            set msgRead to read status of msg as string
+            set msgFlagged to flagged status of msg as string
+            if msgCount > 0 then set outputText to outputText & recSep
+            set outputText to outputText & msgId & fieldSep & msgSubject & fieldSep & msgSender & fieldSep & msgDateStr & fieldSep & msgRead & fieldSep & msgFlagged
+            set msgCount to msgCount + 1
+          end if
           ${dateFilter ? "end if" : ""}
         end try
       end repeat
