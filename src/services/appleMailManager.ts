@@ -419,6 +419,10 @@ export class AppleMailManager {
    * all mailboxes in all accounts to find the message.
    */
   getMessageById(id: string): Message | null {
+    if (!/^\d+$/.test(id)) {
+      console.error(`Invalid message ID: "${id}"`);
+      return null;
+    }
     const script = buildAppLevelScript(`
       try
         set fieldSep to character id 57345
@@ -478,6 +482,10 @@ export class AppleMailManager {
    * Get the content of a message.
    */
   getMessageContent(id: string): MessageContent | null {
+    if (!/^\d+$/.test(id)) {
+      console.error(`Invalid message ID: "${id}"`);
+      return null;
+    }
     const script = buildAppLevelScript(`
       try
         set contentSep to character id 57347
@@ -803,6 +811,10 @@ export class AppleMailManager {
    * @returns true if reply created/sent successfully
    */
   replyToMessage(id: string, body: string, replyAll = false, send = true): boolean {
+    if (!/^\d+$/.test(id)) {
+      console.error(`Invalid message ID: "${id}"`);
+      return false;
+    }
     const safeBody = escapeForAppleScript(body);
     const replyAllClause = replyAll ? " with reply to all" : "";
     const sendAction = send ? "send theReply" : "";
@@ -849,6 +861,10 @@ export class AppleMailManager {
    * @returns true if forward created/sent successfully
    */
   forwardMessage(id: string, to: string[], body?: string, send = true): boolean {
+    if (!/^\d+$/.test(id)) {
+      console.error(`Invalid message ID: "${id}"`);
+      return false;
+    }
     const safeBody = body ? escapeForAppleScript(body) : "";
     const sendAction = send ? "send theForward" : "";
 
@@ -895,6 +911,9 @@ export class AppleMailManager {
    * Helper to find and operate on a message by ID.
    */
   private findMessageScript(id: string, operation: string): string {
+    if (!/^\d+$/.test(id)) {
+      return buildAppLevelScript(`return "error:Invalid message ID"`);
+    }
     return buildAppLevelScript(`
       try
         repeat with acct in accounts
@@ -995,6 +1014,10 @@ export class AppleMailManager {
    * Move a message to a different mailbox.
    */
   moveMessage(id: string, mailbox: string, account?: string): boolean {
+    if (!/^\d+$/.test(id)) {
+      console.error(`Invalid message ID: "${id}"`);
+      return false;
+    }
     const targetAccount = this.resolveAccount(account);
     const targetMailbox = this.resolveMailbox(mailbox, targetAccount);
     const safeMailbox = escapeForAppleScript(targetMailbox);
@@ -1135,6 +1158,10 @@ export class AppleMailManager {
    * List attachments for a message.
    */
   listAttachments(id: string): Attachment[] {
+    if (!/^\d+$/.test(id)) {
+      console.error(`Invalid message ID: "${id}"`);
+      return [];
+    }
     const script = buildAppLevelScript(`
       try
         set fieldSep to character id 57345
@@ -1194,6 +1221,10 @@ export class AppleMailManager {
    * Save an attachment from a message to disk.
    */
   saveAttachment(id: string, attachmentName: string, savePath: string): boolean {
+    if (!/^\d+$/.test(id)) {
+      console.error(`Invalid message ID: "${id}"`);
+      return false;
+    }
     const safeName = escapeForAppleScript(attachmentName);
     const safePath = escapeForAppleScript(savePath);
 
