@@ -25,6 +25,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { AppleMailManager } from "@/services/appleMailManager.js";
+import { emailAddressSchema } from "@/utils/emailValidation.js";
 
 // Read version from package.json to keep it in sync
 const require = createRequire(import.meta.url);
@@ -198,11 +199,11 @@ server.tool(
 server.tool(
   "send-email",
   {
-    to: z.array(z.string()).min(1, "At least one recipient is required"),
+    to: z.array(emailAddressSchema).min(1, "At least one recipient is required"),
     subject: z.string().min(1, "Subject is required"),
     body: z.string().min(1, "Body is required"),
-    cc: z.array(z.string()).optional().describe("CC recipients"),
-    bcc: z.array(z.string()).optional().describe("BCC recipients"),
+    cc: z.array(emailAddressSchema).optional().describe("CC recipients"),
+    bcc: z.array(emailAddressSchema).optional().describe("BCC recipients"),
     account: z.string().optional().describe("Account to send from"),
     attachments: z
       .array(z.string())
@@ -226,11 +227,11 @@ server.tool(
 server.tool(
   "create-draft",
   {
-    to: z.array(z.string()).min(1, "At least one recipient is required"),
+    to: z.array(emailAddressSchema).min(1, "At least one recipient is required"),
     subject: z.string().min(1, "Subject is required"),
     body: z.string().min(1, "Body is required"),
-    cc: z.array(z.string()).optional().describe("CC recipients"),
-    bcc: z.array(z.string()).optional().describe("BCC recipients"),
+    cc: z.array(emailAddressSchema).optional().describe("CC recipients"),
+    bcc: z.array(emailAddressSchema).optional().describe("BCC recipients"),
     account: z.string().optional().describe("Account to create draft in"),
     attachments: z
       .array(z.string())
@@ -276,7 +277,7 @@ server.tool(
   "forward-message",
   {
     id: z.string().regex(/^\d+$/, "Message ID must be numeric"),
-    to: z.array(z.string()).min(1, "At least one recipient is required"),
+    to: z.array(emailAddressSchema).min(1, "At least one recipient is required"),
     body: z.string().optional().describe("Optional message to prepend"),
     send: z.boolean().optional().default(true).describe("Send immediately (false = save as draft)"),
   },
@@ -804,8 +805,8 @@ server.tool(
     name: z.string().min(1, "Template name is required"),
     subject: z.string().min(1, "Subject is required"),
     body: z.string().min(1, "Body is required"),
-    to: z.array(z.string()).optional().describe("Default recipients"),
-    cc: z.array(z.string()).optional().describe("Default CC recipients"),
+    to: z.array(emailAddressSchema).optional().describe("Default recipients"),
+    cc: z.array(emailAddressSchema).optional().describe("Default CC recipients"),
     id: z.string().optional().describe("Template ID (for updating existing template)"),
   },
   withErrorHandling(({ name, subject, body, to, cc, id }) => {
@@ -887,8 +888,8 @@ server.tool(
   "use-template",
   {
     id: z.string().min(1, "Template ID is required"),
-    to: z.array(z.string()).optional().describe("Override recipients"),
-    cc: z.array(z.string()).optional().describe("Override CC recipients"),
+    to: z.array(emailAddressSchema).optional().describe("Override recipients"),
+    cc: z.array(emailAddressSchema).optional().describe("Override CC recipients"),
     subject: z.string().optional().describe("Override subject"),
     body: z.string().optional().describe("Override body"),
   },
