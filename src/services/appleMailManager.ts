@@ -35,6 +35,9 @@ import type {
   Contact,
   EmailTemplate,
   ThreadMessage,
+  TriageMessage,
+  ActionItemsResult,
+  WaitingForItem,
 } from "@/types.js";
 
 // =============================================================================
@@ -2572,5 +2575,309 @@ export class AppleMailManager {
       running: true,
       accountCount,
     };
+  }
+
+  // ===========================================================================
+  // Phase 4: Intelligence Layer
+  // ===========================================================================
+
+  getTriageMessages(
+    mailbox = "INBOX",
+    limit = 20,
+    includeSnippets = true,
+    account?: string
+  ): TriageMessage[] {
+    const messages = this.listMessages(mailbox, account, limit, undefined, 0, true);
+    return messages.map((msg) => {
+      const entry: TriageMessage = {
+        id: msg.id,
+        subject: msg.subject,
+        sender: msg.sender,
+        dateReceived: msg.dateReceived,
+        isRead: msg.isRead,
+        isFlagged: msg.isFlagged,
+        hasAttachments: msg.hasAttachments,
+        mailbox: msg.mailbox,
+        account: msg.account,
+      };
+      if (includeSnippets) {
+        const content = this.getMessageContent(msg.id);
+        if (content) {
+          entry.snippet = content.plainText.slice(0, 200).replace(/\n+/g, " ").trim();
+        }
+      }
+      return entry;
+    });
+  }
+
+  getSummarizeInboxData(
+    mailbox = "INBOX",
+    limit = 30,
+    account?: string
+  ): { totalUnread: number; messages: Message[] } {
+    const totalUnread = this.getUnreadCount(mailbox, account);
+    const messages = this.listMessages(mailbox, account, limit, undefined, 0, true);
+    return { totalUnread, messages };
+  }
+
+  getActionItems(
+    id?: string,
+    mailbox = "INBOX",
+    limit = 10,
+    account?: string
+  ): ActionItemsResult[] {
+    if (id) {
+      if (!/^\d+$/.test(id)) {
+        console.error(`Invalid message ID: "${id}"`);
+        return [];
+      }
+      const msg = this.getMessageById(id);
+      if (!msg) return [];
+      const content = this.getMessageContent(id);
+      if (!content) return [];
+      return [
+        {
+          id: msg.id,
+          subject: msg.subject,
+          sender: msg.sender,
+          dateReceived: msg.dateReceived,
+          plainText: content.plainText,
+        },
+      ];
+    }
+    const messages = this.listMessages(mailbox, account, limit);
+    const results: ActionItemsResult[] = [];
+    for (const msg of messages) {
+      const content = this.getMessageContent(msg.id);
+      if (content) {
+        results.push({
+          id: msg.id,
+          subject: msg.subject,
+          sender: msg.sender,
+          dateReceived: msg.dateReceived,
+          plainText: content.plainText,
+        });
+      }
+    }
+    return results;
+  }
+
+  getUnsubscribeLinks(id: string): {
+    isLikelyNewsletter: boolean;
+    newsletterSignals: string[];
+    unsubscribeLinks: string[];
+  } {
+    if (!/^\d+$/.test(id)) {
+      console.error(`Invalid message ID: "${id}"`);
+      return { isLikelyNewsletter: false, newsletterSignals: [], unsubscribeLinks: [] };
+    }
+    const content = this.getMessageContent(id);
+    if (!content) {
+      return { isLikelyNewsletter: false, newsletterSignals: [], unsubscribeLinks: [] };
+    }
+
+    const html = content.htmlContent ?? "";
+    const links: string[] = [];
+
+    // Pass 1: links where anchor text contains unsubscribe/optout/opt-out/remove
+    const textPattern =
+      /<a[^>]+href=["']([^"']+)["'][^>]*>[^<]*(?:unsubscribe|opt.out|remove)[^<]*<\/a>/gi;
+    // Pass 2: links where href itself contains those keywords
+    const hrefPattern = /href=["']([^"']*(?:unsubscribe|optout|opt-out|remove)[^"']*)/gi;
+
+    let match: RegExpExecArray | null;
+    while ((match = textPattern.exec(html)) !== null) {
+      if (!links.includes(match[1])) links.push(match[1]);
+    }
+    while ((match = hrefPattern.exec(html)) !== null) {
+      if (!links.includes(match[1])) links.push(match[1]);
+    }
+
+    // Newsletter heuristics
+    const signals: string[] = [];
+    const msg = this.getMessageById(id);
+    if (msg) {
+      const lcSender = msg.sender.toLowerCase();
+      const lcSubject = msg.subject.toLowerCase();
+      if (
+        /mailchimp|substack|constantcontact|campaignmonitor|sendgrid|klaviyo|hubspot/.test(lcSender)
+      ) {
+        signals.push("Known newsletter sender domain");
+      }
+      if (/list-unsubscribe/i.test(html)) {
+        signals.push("Contains List-Unsubscribe header in source");
+      }
+      if (/weekly|digest|newsletter|update|bulletin/i.test(lcSubject)) {
+        signals.push("Subject contains newsletter keywords");
+      }
+      if (links.length > 0) {
+        signals.push("Unsubscribe link found in HTML");
+      }
+    }
+
+    return {
+      isLikelyNewsletter: signals.length >= 2,
+      newsletterSignals: signals,
+      unsubscribeLinks: links,
+    };
+  }
+
+  getDraftReplyContext(
+    id: string,
+    draftBody?: string,
+    maxMessages = 5,
+    bodyTruncate = 500,
+    account?: string
+  ): { context: string; draftCreated?: boolean } {
+    if (!/^\d+$/.test(id)) {
+      console.error(`Invalid message ID: "${id}"`);
+      return { context: "Error: Invalid message ID." };
+    }
+
+    const seed = this.getMessageById(id);
+    if (!seed) {
+      return { context: "Error: Message not found." };
+    }
+
+    const thread = this.getThread(id, account);
+    const relevant = thread.length > 0 ? thread.slice(-maxMessages) : [];
+
+    const lines: string[] = [];
+    lines.push(`Thread context for reply (${relevant.length} message(s)):`);
+    lines.push("");
+
+    if (relevant.length === 0) {
+      // Fallback: show seed message only
+      const content = this.getMessageContent(id);
+      lines.push(
+        `[Message] From: ${seed.sender} | ${seed.dateReceived.toISOString().slice(0, 10)}`
+      );
+      lines.push(`Subject: ${seed.subject}`);
+      lines.push("---");
+      lines.push(content ? content.plainText.slice(0, bodyTruncate) : "(body unavailable)");
+    } else {
+      for (let i = 0; i < relevant.length; i++) {
+        const tm = relevant[i];
+        const label = i === 0 ? "Original" : `Message ${i + 1}`;
+        const content = this.getMessageContent(tm.id);
+        lines.push(`[${label}] From: ${tm.sender} | ${tm.dateReceived.toISOString().slice(0, 10)}`);
+        lines.push(`Subject: ${tm.subject}`);
+        lines.push("---");
+        lines.push(content ? content.plainText.slice(0, bodyTruncate) : "(body unavailable)");
+        lines.push("");
+      }
+    }
+
+    let draftCreated: boolean | undefined;
+    if (draftBody !== undefined && seed.recipients.length > 0) {
+      const replyTo = seed.replyTo ?? seed.sender;
+      draftCreated = this.createDraft(
+        [replyTo],
+        `Re: ${normalizeSubject(seed.subject)}`,
+        draftBody
+      );
+    }
+
+    return { context: lines.join("\n"), draftCreated };
+  }
+
+  getThreadSummaryData(
+    id: string,
+    maxMessages = 20,
+    bodyTruncate = 1000,
+    account?: string
+  ): string {
+    if (!/^\d+$/.test(id)) {
+      console.error(`Invalid message ID: "${id}"`);
+      return "Error: Invalid message ID.";
+    }
+
+    const thread = this.getThread(id, account);
+    if (thread.length === 0) {
+      const seed = this.getMessageById(id);
+      if (!seed) return "Error: Message not found.";
+      const content = this.getMessageContent(id);
+      return [
+        `Thread data (1 message — subject too short for thread search or no thread found):`,
+        "",
+        `[Message] From: ${seed.sender} | ${seed.dateReceived.toISOString().slice(0, 10)}`,
+        `Subject: ${seed.subject}`,
+        "---",
+        content ? content.plainText.slice(0, bodyTruncate) : "(body unavailable)",
+      ].join("\n");
+    }
+
+    const relevant = thread.slice(-maxMessages);
+    const lines: string[] = [`Thread data (${relevant.length} message(s)):`, ""];
+
+    for (let i = 0; i < relevant.length; i++) {
+      const tm = relevant[i];
+      const content = this.getMessageContent(tm.id);
+      lines.push(`[${i + 1}] From: ${tm.sender} | ${tm.dateReceived.toISOString().slice(0, 10)}`);
+      lines.push(`Subject: ${tm.subject}`);
+      lines.push("---");
+      lines.push(content ? content.plainText.slice(0, bodyTruncate) : "(body unavailable)");
+      lines.push("");
+    }
+
+    return lines.join("\n");
+  }
+
+  getWaitingFor(limit = 20, daysAgo = 2, account?: string): WaitingForItem[] {
+    // Build set of user's own email addresses
+    const accounts = this.listAccounts();
+    const userEmails = new Set(accounts.map((a) => a.email.toLowerCase()));
+
+    // Fetch recent sent messages
+    const sentMessages = this.searchMessages(
+      undefined,
+      "Sent",
+      account,
+      limit + 20, // fetch extra to account for daysAgo filtering
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      false,
+      0
+    );
+
+    const now = new Date();
+    const thresholdMs = daysAgo * 24 * 60 * 60 * 1000;
+
+    const waiting: WaitingForItem[] = [];
+
+    for (const msg of sentMessages) {
+      if (waiting.length >= limit) break;
+
+      // Only consider messages older than daysAgo threshold
+      const age = now.getTime() - msg.dateReceived.getTime();
+      if (age < thresholdMs) continue;
+
+      // Check for replies via thread
+      const thread = this.getThread(msg.id, account);
+      const hasReply = thread.some(
+        (tm) =>
+          !userEmails.has(tm.sender.toLowerCase()) &&
+          tm.dateReceived.getTime() > msg.dateReceived.getTime()
+      );
+
+      if (!hasReply) {
+        waiting.push({
+          id: msg.id,
+          subject: msg.subject,
+          sender: msg.sender,
+          recipients: msg.recipients,
+          dateSent: msg.dateReceived, // dateReceived on sent messages = when sent
+          daysWaiting: Math.floor(age / (24 * 60 * 60 * 1000)),
+          hasReply: false,
+        });
+      }
+    }
+
+    // Sort oldest first (most overdue)
+    waiting.sort((a, b) => a.dateSent.getTime() - b.dateSent.getTime());
+    return waiting;
   }
 }
