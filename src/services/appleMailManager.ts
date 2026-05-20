@@ -1180,11 +1180,54 @@ export class AppleMailManager {
 
   /**
    * Helper to find and operate on a message by ID.
+   *
+   * Cache fast-path: if the message location is cached, generates a targeted
+   * single-mailbox AppleScript instead of the O(accounts×mailboxes) nested loop.
+   * The targeted script includes an inline full-scan fallback so it handles stale
+   * cache entries (message moved externally) transparently in a single osascript call.
    */
   private findMessageScript(id: string, operation: string): string {
     if (!/^\d+$/.test(id)) {
       return buildAppLevelScript(`return "error:Invalid message ID"`);
     }
+
+    const location = this.resolveMessageLocation(id);
+    if (location) {
+      // Cache HIT — target the known mailbox directly, then fall back to full scan
+      const safeMailbox = escapeForAppleScript(location.mailbox);
+      const safeAccount = escapeForAppleScript(location.account);
+      return buildAppLevelScript(`
+        try
+          set targetMb to mailbox "${safeMailbox}" of account "${safeAccount}"
+          set matchingMsgs to (messages of targetMb whose id is ${id})
+          if (count of matchingMsgs) > 0 then
+            set msg to item 1 of matchingMsgs
+            ${operation}
+            return "ok"
+          end if
+        end try
+        -- Cache stale or message moved: fall back to full scan
+        try
+          repeat with acct in accounts
+            repeat with mb in mailboxes of acct
+              try
+                set matchingMsgs to (messages of mb whose id is ${id})
+                if (count of matchingMsgs) > 0 then
+                  set msg to item 1 of matchingMsgs
+                  ${operation}
+                  return "ok"
+                end if
+              end try
+            end repeat
+          end repeat
+          return "error:Message not found"
+        on error errMsg
+          return "error:" & errMsg
+        end try
+      `);
+    }
+
+    // Cache MISS — use the full nested-loop scan
     return buildAppLevelScript(`
       try
         repeat with acct in accounts
