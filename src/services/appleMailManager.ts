@@ -14,6 +14,7 @@
  */
 
 import { executeAppleScript } from "@/utils/applescript.js";
+import { validateSavePath } from "@/utils/pathSecurity.js";
 import type {
   Message,
   MessageContent,
@@ -678,7 +679,8 @@ export class AppleMailManager {
     let attachmentCommands = "";
     if (attachments) {
       for (const filePath of attachments) {
-        const safePath = escapeForAppleScript(filePath);
+        const validatedFilePath = validateSavePath(filePath); // throws on traversal
+        const safePath = escapeForAppleScript(validatedFilePath);
         attachmentCommands += `make new attachment with properties {file name:POSIX file "${safePath}"} at after the last paragraph\n`;
       }
     }
@@ -762,7 +764,8 @@ export class AppleMailManager {
     let attachmentCommands = "";
     if (attachments) {
       for (const filePath of attachments) {
-        const safePath = escapeForAppleScript(filePath);
+        const validatedFilePath = validateSavePath(filePath); // throws on traversal
+        const safePath = escapeForAppleScript(validatedFilePath);
         attachmentCommands += `make new attachment with properties {file name:POSIX file "${safePath}"} at after the last paragraph\n`;
       }
     }
@@ -1225,8 +1228,9 @@ export class AppleMailManager {
       console.error(`Invalid message ID: "${id}"`);
       return false;
     }
+    const validatedPath = validateSavePath(savePath); // throws on bad path
     const safeName = escapeForAppleScript(attachmentName);
-    const safePath = escapeForAppleScript(savePath);
+    const safePath = escapeForAppleScript(validatedPath);
 
     const script = buildAppLevelScript(`
       try
