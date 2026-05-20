@@ -787,10 +787,12 @@ export class AppleMailManager {
     cc?: string[],
     bcc?: string[],
     account?: string,
-    attachments?: string[]
+    attachments?: string[],
+    isHtml?: boolean
   ): boolean {
     const safeSubject = escapeForAppleScript(subject);
     const safeBody = escapeForAppleScript(body);
+    const contentBody = isHtml ? escapeForAppleScript(body) : safeBody;
 
     // Build recipient additions
     let recipientCommands = "";
@@ -821,7 +823,19 @@ export class AppleMailManager {
     let sendCommand: string;
     if (account) {
       const safeAccount = escapeForAppleScript(account);
-      sendCommand = `
+      sendCommand = isHtml
+        ? `
+        set newMessage to make new outgoing message with properties {subject:"${safeSubject}", visible:true}
+        tell newMessage
+          make new body part at beginning of body parts with properties {content:"${contentBody}", mime type:"text/html"}
+          ${recipientCommands}
+          set sender to "${safeAccount}"
+          ${attachmentCommands}
+        end tell
+        send newMessage
+        return "sent"
+      `
+        : `
         set newMessage to make new outgoing message with properties {subject:"${safeSubject}", content:"${safeBody}", visible:true}
         tell newMessage
           ${recipientCommands}
@@ -832,7 +846,18 @@ export class AppleMailManager {
         return "sent"
       `;
     } else {
-      sendCommand = `
+      sendCommand = isHtml
+        ? `
+        set newMessage to make new outgoing message with properties {subject:"${safeSubject}", visible:true}
+        tell newMessage
+          make new body part at beginning of body parts with properties {content:"${contentBody}", mime type:"text/html"}
+          ${recipientCommands}
+          ${attachmentCommands}
+        end tell
+        send newMessage
+        return "sent"
+      `
+        : `
         set newMessage to make new outgoing message with properties {subject:"${safeSubject}", content:"${safeBody}", visible:true}
         tell newMessage
           ${recipientCommands}
@@ -872,10 +897,12 @@ export class AppleMailManager {
     cc?: string[],
     bcc?: string[],
     account?: string,
-    attachments?: string[]
+    attachments?: string[],
+    isHtml?: boolean
   ): boolean {
     const safeSubject = escapeForAppleScript(subject);
     const safeBody = escapeForAppleScript(body);
+    const contentBody = isHtml ? escapeForAppleScript(body) : safeBody;
 
     // Build recipient additions
     let recipientCommands = "";
@@ -906,7 +933,18 @@ export class AppleMailManager {
     let draftCommand: string;
     if (account) {
       const safeAccount = escapeForAppleScript(account);
-      draftCommand = `
+      draftCommand = isHtml
+        ? `
+        set newMessage to make new outgoing message with properties {subject:"${safeSubject}", visible:false}
+        tell newMessage
+          make new body part at beginning of body parts with properties {content:"${contentBody}", mime type:"text/html"}
+          ${recipientCommands}
+          set sender to "${safeAccount}"
+          ${attachmentCommands}
+        end tell
+        return "draft created"
+      `
+        : `
         set newMessage to make new outgoing message with properties {subject:"${safeSubject}", content:"${safeBody}", visible:false}
         tell newMessage
           ${recipientCommands}
@@ -916,7 +954,17 @@ export class AppleMailManager {
         return "draft created"
       `;
     } else {
-      draftCommand = `
+      draftCommand = isHtml
+        ? `
+        set newMessage to make new outgoing message with properties {subject:"${safeSubject}", visible:false}
+        tell newMessage
+          make new body part at beginning of body parts with properties {content:"${contentBody}", mime type:"text/html"}
+          ${recipientCommands}
+          ${attachmentCommands}
+        end tell
+        return "draft created"
+      `
+        : `
         set newMessage to make new outgoing message with properties {subject:"${safeSubject}", content:"${safeBody}", visible:false}
         tell newMessage
           ${recipientCommands}

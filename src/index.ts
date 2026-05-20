@@ -233,9 +233,15 @@ server.tool(
       .array(z.string())
       .optional()
       .describe("Absolute file paths to attach (e.g., ['/Users/me/report.pdf'])"),
+    isHtml: z
+      .boolean()
+      .optional()
+      .describe(
+        "Send as HTML email. When true, body is rendered as HTML markup rather than plain text."
+      ),
   },
-  withErrorHandling(({ to, subject, body, cc, bcc, account, attachments }) => {
-    const success = mailManager.sendEmail(to, subject, body, cc, bcc, account, attachments);
+  withErrorHandling(({ to, subject, body, cc, bcc, account, attachments, isHtml }) => {
+    const success = mailManager.sendEmail(to, subject, body, cc, bcc, account, attachments, isHtml);
 
     if (!success) {
       return errorResponse("Failed to send email. Check Mail.app configuration.");
@@ -261,9 +267,24 @@ server.tool(
       .array(z.string())
       .optional()
       .describe("Absolute file paths to attach (e.g., ['/Users/me/report.pdf'])"),
+    isHtml: z
+      .boolean()
+      .optional()
+      .describe(
+        "Create as HTML email. When true, body is rendered as HTML markup rather than plain text."
+      ),
   },
-  withErrorHandling(({ to, subject, body, cc, bcc, account, attachments }) => {
-    const success = mailManager.createDraft(to, subject, body, cc, bcc, account, attachments);
+  withErrorHandling(({ to, subject, body, cc, bcc, account, attachments, isHtml }) => {
+    const success = mailManager.createDraft(
+      to,
+      subject,
+      body,
+      cc,
+      bcc,
+      account,
+      attachments,
+      isHtml
+    );
 
     if (!success) {
       return errorResponse("Failed to create draft. Check Mail.app configuration.");
