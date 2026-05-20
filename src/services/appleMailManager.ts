@@ -1409,6 +1409,12 @@ export class AppleMailManager {
 
     if (!result.success || result.output.startsWith("error:")) {
       console.error(`Failed to rename mailbox: ${result.error || result.output}`);
+      // ROLLBACK: Delete the new mailbox we just created to restore original state.
+      // Note: If the move loop ran partially before failing, some messages may exist
+      // in both mailboxes at this point. We delete the new mailbox only; the old
+      // mailbox retains its full original set. This is strictly better than leaving
+      // an empty new mailbox orphaned.
+      this.deleteMailbox(newName, targetAccount);
       return false;
     }
 
