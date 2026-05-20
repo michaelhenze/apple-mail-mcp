@@ -185,6 +185,7 @@ export class AppleMailManager {
   private cache = {
     accounts: null as { data: Account[]; expiry: number } | null,
     mailboxNames: new Map<string, { data: string[]; expiry: number }>(),
+    messageLocations: new Map<string, { mailbox: string; account: string; expiry: number }>(),
   };
 
   /** Cache TTL in milliseconds (60 seconds). */
@@ -192,6 +193,9 @@ export class AppleMailManager {
 
   /** TTL for the default account cache (5 minutes). */
   private readonly DEFAULT_ACCOUNT_TTL_MS = 5 * 60_000;
+
+  /** TTL for the message location cache (5 minutes). */
+  private readonly MESSAGE_LOCATION_TTL_MS = 5 * 60_000;
 
   /**
    * Returns cached accounts or fetches fresh data if cache is expired/empty.
@@ -229,7 +233,32 @@ export class AppleMailManager {
   private invalidateCache(): void {
     this.cache.accounts = null;
     this.cache.mailboxNames.clear();
+    this.cache.messageLocations.clear();
     this.defaultAccountCache = null;
+  }
+
+  /**
+   * Resolves a cached message location by ID.
+   * Returns null if not cached or TTL has expired.
+   */
+  private resolveMessageLocation(id: string): { mailbox: string; account: string } | null {
+    const now = Date.now();
+    const cached = this.cache.messageLocations.get(id);
+    if (cached && now < cached.expiry) {
+      return { mailbox: cached.mailbox, account: cached.account };
+    }
+    return null;
+  }
+
+  /**
+   * Stores a message's location in the cache with a TTL.
+   */
+  private cacheMessageLocation(id: string, mailbox: string, account: string): void {
+    this.cache.messageLocations.set(id, {
+      mailbox,
+      account,
+      expiry: Date.now() + this.MESSAGE_LOCATION_TTL_MS,
+    });
   }
 
   /**
@@ -611,6 +640,8 @@ export class AppleMailManager {
     const parts = result.output.split(FIELD_SEP);
     if (parts.length < 9) return null;
 
+    this.cacheMessageLocation(id, parts[7], parts[8]);
+
     return {
       id: id.toString(),
       subject: parts[0],
@@ -771,8 +802,10 @@ export class AppleMailManager {
       const parts = item.split(FIELD_SEP);
       if (parts.length < 6) continue;
 
+      const msgId = parts[0].trim();
+      this.cacheMessageLocation(msgId, mailbox, account);
       messages.push({
-        id: parts[0].trim(),
+        id: msgId,
         subject: parts[1],
         sender: parts[2],
         recipients: [],
@@ -802,8 +835,10 @@ export class AppleMailManager {
       const parts = item.split(FIELD_SEP);
       if (parts.length < 7) continue;
 
+      const msgId = parts[0].trim();
+      this.cacheMessageLocation(msgId, parts[6], account);
       messages.push({
-        id: parts[0].trim(),
+        id: msgId,
         subject: parts[1],
         sender: parts[2],
         recipients: [],
@@ -1301,6 +1336,7 @@ export class AppleMailManager {
       return false;
     }
 
+    this.cache.messageLocations.delete(id);
     return true;
   }
 
@@ -1345,6 +1381,7 @@ export class AppleMailManager {
       return false;
     }
 
+    this.cacheMessageLocation(id, targetMailbox, targetAccount);
     return true;
   }
 
