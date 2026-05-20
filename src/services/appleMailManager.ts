@@ -442,7 +442,40 @@ export class AppleMailManager {
                 set msgDeleted to deleted status of msg as string
                 set msgMailbox to name of mb
                 set msgAccount to name of acct
-                return msgSubject & fieldSep & msgSender & fieldSep & msgDate & fieldSep & msgRead & fieldSep & msgFlagged & fieldSep & msgJunk & fieldSep & msgDeleted & fieldSep & msgMailbox & fieldSep & msgAccount
+                -- recipients (field 10)
+                set msgRecipients to ""
+                try
+                  repeat with r in to recipients of msg
+                    if msgRecipients is not "" then set msgRecipients to msgRecipients & ","
+                    set msgRecipients to msgRecipients & (address of r)
+                  end repeat
+                end try
+                -- cc recipients (field 11)
+                set msgCC to ""
+                try
+                  repeat with r in cc recipients of msg
+                    if msgCC is not "" then set msgCC to msgCC & ","
+                    set msgCC to msgCC & (address of r)
+                  end repeat
+                end try
+                -- reply-to (field 12) — may not exist on all messages; wrap in try
+                set msgReplyTo to ""
+                try
+                  set msgReplyTo to reply to of msg
+                end try
+                -- has attachments (field 13)
+                set msgHasAtt to (count of mail attachments of msg) > 0
+                -- attachment names (field 14) — comma-joined
+                set msgAttNames to ""
+                if msgHasAtt then
+                  try
+                    repeat with att in mail attachments of msg
+                      if msgAttNames is not "" then set msgAttNames to msgAttNames & ","
+                      set msgAttNames to msgAttNames & (name of att)
+                    end repeat
+                  end try
+                end if
+                return msgSubject & fieldSep & msgSender & fieldSep & msgDate & fieldSep & msgRead & fieldSep & msgFlagged & fieldSep & msgJunk & fieldSep & msgDeleted & fieldSep & msgMailbox & fieldSep & msgAccount & fieldSep & msgRecipients & fieldSep & msgCC & fieldSep & msgReplyTo & fieldSep & (msgHasAtt as string) & fieldSep & msgAttNames
               end if
             end try
           end repeat
@@ -467,7 +500,12 @@ export class AppleMailManager {
       id: id.toString(),
       subject: parts[0],
       sender: parts[1],
-      recipients: [],
+      senderName: parts[1].includes("<")
+        ? parts[1].split("<")[0].trim().replace(/^"/, "").replace(/"$/, "") || undefined
+        : undefined,
+      recipients: parts[9] ? parts[9].split(",").filter(Boolean) : [],
+      ccRecipients: parts[10] ? parts[10].split(",").filter(Boolean) : undefined,
+      replyTo: parts[11] || undefined,
       dateReceived: parseAppleScriptDate(parts[2]),
       isRead: parts[3] === "true",
       isFlagged: parts[4] === "true",
@@ -475,7 +513,8 @@ export class AppleMailManager {
       isDeleted: parts[6] === "true",
       mailbox: parts[7],
       account: parts[8],
-      hasAttachments: false,
+      hasAttachments: parts[12] === "true",
+      attachmentNames: parts[13] ? parts[13].split(",").filter(Boolean) : undefined,
     };
   }
 

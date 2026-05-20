@@ -37,6 +37,9 @@ export interface Message {
   /** CC recipients */
   ccRecipients?: string[];
 
+  /** Reply-to address (if different from sender) */
+  replyTo?: string;
+
   /** BCC recipients (only available for sent mail) */
   bccRecipients?: string[];
 
@@ -66,6 +69,9 @@ export interface Message {
 
   /** Whether the message has attachments */
   hasAttachments: boolean;
+
+  /** Names of attachments on this message */
+  attachmentNames?: string[];
 }
 
 /**
