@@ -1251,6 +1251,319 @@ server.tool(
 );
 
 // =============================================================================
+// Intelligence Layer Tools (Phase 4)
+// =============================================================================
+
+server.tool(
+  "triage-inbox",
+  {
+    limit: z
+      .number()
+      .optional()
+      .describe(
+        "Max unread messages to fetch (default: 20). Keep low if includeSnippets=true — each snippet is one AppleScript call."
+      ),
+    includeSnippets: z
+      .boolean()
+      .optional()
+      .describe(
+        "Fetch first 200 chars of body per message (default: true). Set false for faster results on large inboxes."
+      ),
+    mailbox: z.string().optional().describe("Mailbox to triage (default: INBOX)"),
+    account: z.string().optional().describe("Account to triage (omit for default account)"),
+  },
+  withErrorHandling(({ limit = 20, includeSnippets = true, mailbox = "INBOX", account }) => {
+    const messages = mailManager.getTriageMessages(mailbox, limit, includeSnippets, account);
+
+    if (messages.length === 0) {
+      return successResponse("Triage data: 0 unread messages found.");
+    }
+
+    const lines: string[] = [
+      `Triage data: ${messages.length} unread message(s) in ${mailbox}`,
+      "",
+      "Classify each as: urgent / FYI / deletable",
+      "═══════════════════════════════════════════",
+      "",
+    ];
+
+    messages.forEach((msg, i) => {
+      lines.push(`[${i + 1}] ID: ${msg.id}`);
+      lines.push(`  From: ${msg.sender}`);
+      lines.push(`  Subject: ${msg.subject}`);
+      lines.push(`  Date: ${msg.dateReceived.toISOString().slice(0, 16).replace("T", " ")}`);
+      lines.push(
+        `  Flagged: ${msg.isFlagged ? "yes" : "no"} | Attachments: ${msg.hasAttachments ? "yes" : "no"}`
+      );
+      if (msg.snippet) lines.push(`  Snippet: "${msg.snippet}"`);
+      lines.push("");
+    });
+
+    return successResponse(lines.join("\n"));
+  }, "Error triaging inbox")
+);
+
+server.tool(
+  "find-action-items",
+  {
+    id: z
+      .string()
+      .optional()
+      .describe("Message ID to scan (single message mode). Provide this OR mailbox, not both."),
+    mailbox: z
+      .string()
+      .optional()
+      .describe("Mailbox to scan for action items (default: INBOX). Used when id is not provided."),
+    limit: z
+      .number()
+      .optional()
+      .describe(
+        "Max messages to scan in mailbox mode (default: 10). Each message is one AppleScript call."
+      ),
+    account: z.string().optional().describe("Account to scan (omit for default account)"),
+  },
+  withErrorHandling(({ id, mailbox = "INBOX", limit = 10, account }) => {
+    const results = mailManager.getActionItems(id, mailbox, limit, account);
+
+    if (results.length === 0) {
+      return successResponse("No messages found for action-item extraction.");
+    }
+
+    const lines: string[] = [
+      `Action item source data: ${results.length} message(s)`,
+      "",
+      "Extract to-dos, deadlines, and requests from the bodies below.",
+      "═══════════════════════════════════════════════════════════════",
+      "",
+    ];
+
+    results.forEach((item, i) => {
+      lines.push(`[${i + 1}] ID: ${item.id}`);
+      lines.push(`  From: ${item.sender}`);
+      lines.push(`  Subject: ${item.subject}`);
+      lines.push(`  Date: ${item.dateReceived.toISOString().slice(0, 16).replace("T", " ")}`);
+      lines.push("  Body:");
+      lines.push(
+        item.plainText
+          .split("\n")
+          .map((l) => `    ${l}`)
+          .join("\n")
+      );
+      lines.push("");
+    });
+
+    return successResponse(lines.join("\n"));
+  }, "Error finding action items")
+);
+
+server.tool(
+  "summarize-inbox",
+  {
+    mailbox: z.string().optional().describe("Mailbox to summarize (default: INBOX)"),
+    limit: z
+      .number()
+      .optional()
+      .describe("Max unread messages to include in briefing data (default: 30)"),
+    account: z.string().optional().describe("Account to summarize (omit for all accounts)"),
+  },
+  withErrorHandling(({ mailbox = "INBOX", limit = 30, account }) => {
+    const { totalUnread, messages } = mailManager.getSummarizeInboxData(mailbox, limit, account);
+
+    const lines: string[] = [
+      `Inbox briefing data: ${totalUnread} total unread in ${mailbox}`,
+      `Showing ${messages.length} message(s)`,
+      "",
+      "Produce a concise morning briefing summarizing who wrote, about what, and any notable patterns.",
+      "═══════════════════════════════════════════════════════════════════════════════════════════════",
+      "",
+    ];
+
+    messages.forEach((msg, i) => {
+      lines.push(`[${i + 1}] From: ${msg.sender}`);
+      lines.push(`    Subject: ${msg.subject}`);
+      lines.push(`    Date: ${msg.dateReceived.toISOString().slice(0, 16).replace("T", " ")}`);
+      lines.push(
+        `    Flagged: ${msg.isFlagged ? "yes" : "no"} | Attachments: ${msg.hasAttachments ? "yes" : "no"}`
+      );
+      lines.push("");
+    });
+
+    return successResponse(lines.join("\n"));
+  }, "Error summarizing inbox")
+);
+
+server.tool(
+  "unsubscribe-helper",
+  {
+    id: z.string().describe("Message ID to inspect for unsubscribe links"),
+  },
+  withErrorHandling(({ id }) => {
+    const result = mailManager.getUnsubscribeLinks(id);
+
+    const lines: string[] = [
+      `Unsubscribe analysis for message ${id}`,
+      "═══════════════════════════════════════",
+      "",
+      `Likely newsletter: ${result.isLikelyNewsletter ? "YES" : "NO"}`,
+    ];
+
+    if (result.newsletterSignals.length > 0) {
+      lines.push("");
+      lines.push("Newsletter signals:");
+      result.newsletterSignals.forEach((s) => lines.push(`  - ${s}`));
+    }
+
+    lines.push("");
+    if (result.unsubscribeLinks.length === 0) {
+      lines.push("No unsubscribe links found in HTML body.");
+      lines.push("The email may use a mailto: link or a button not detectable by link regex.");
+    } else {
+      lines.push(`Unsubscribe link(s) found (${result.unsubscribeLinks.length}):`);
+      result.unsubscribeLinks.forEach((link, i) => lines.push(`  [${i + 1}] ${link}`));
+      lines.push("");
+      lines.push("Confirm with the user which link to use before opening.");
+    }
+
+    return successResponse(lines.join("\n"));
+  }, "Error analyzing unsubscribe links")
+);
+
+server.tool(
+  "draft-reply",
+  {
+    id: z.string().describe("Message ID of the email to reply to (any message in the thread)"),
+    draftBody: z
+      .string()
+      .optional()
+      .describe(
+        "Reply text to use as the draft body. If provided, creates a draft immediately. If omitted, returns thread context for you to compose the reply."
+      ),
+    maxMessages: z
+      .number()
+      .optional()
+      .describe("Max thread messages to include in context (default: 5, most recent)"),
+    bodyTruncate: z
+      .number()
+      .optional()
+      .describe("Max characters per message body in context (default: 500)"),
+    account: z
+      .string()
+      .optional()
+      .describe("Account to scope thread search to (omit to search all accounts)"),
+  },
+  withErrorHandling(({ id, draftBody, maxMessages = 5, bodyTruncate = 500, account }) => {
+    const { context, draftCreated } = mailManager.getDraftReplyContext(
+      id,
+      draftBody,
+      maxMessages,
+      bodyTruncate,
+      account
+    );
+
+    const lines: string[] = [];
+
+    if (draftBody !== undefined) {
+      lines.push(
+        draftCreated
+          ? `Draft reply created successfully. Review it in Mail.app before sending.`
+          : `Failed to create draft. Check that Mail.app has the message and that the recipient address is valid.`
+      );
+      lines.push("");
+    }
+
+    lines.push(context);
+
+    if (draftBody === undefined) {
+      lines.push("");
+      lines.push(
+        "To create the draft, call draft-reply again with the same id and your reply text in the draftBody parameter."
+      );
+    }
+
+    return successResponse(lines.join("\n"));
+  }, "Error preparing draft reply")
+);
+
+server.tool(
+  "summarize-thread",
+  {
+    id: z.string().describe("Message ID of any message in the thread to summarize"),
+    maxMessages: z
+      .number()
+      .optional()
+      .describe("Max thread messages to include (default: 20, most recent)"),
+    bodyTruncate: z.number().optional().describe("Max characters per message body (default: 1000)"),
+    account: z
+      .string()
+      .optional()
+      .describe("Account to scope thread search to (omit to search all accounts)"),
+  },
+  withErrorHandling(({ id, maxMessages = 20, bodyTruncate = 1000, account }) => {
+    const threadData = mailManager.getThreadSummaryData(id, maxMessages, bodyTruncate, account);
+
+    const lines: string[] = [
+      `Thread summary data for message ${id}`,
+      "",
+      "Summarize this thread in 3-5 sentences: current status, key decisions, and open questions.",
+      "═══════════════════════════════════════════════════════════════════════════════════════════",
+      "",
+      threadData,
+    ];
+
+    return successResponse(lines.join("\n"));
+  }, "Error summarizing thread")
+);
+
+server.tool(
+  "detect-waiting-for",
+  {
+    limit: z
+      .number()
+      .optional()
+      .describe(
+        "Max sent messages to check for replies (default: 20). Each check calls getThread — keep limit reasonable."
+      ),
+    daysAgo: z
+      .number()
+      .optional()
+      .describe(
+        "Only check messages sent at least this many days ago (default: 2 — ignore very recent sends)"
+      ),
+    account: z
+      .string()
+      .optional()
+      .describe("Account to scan Sent folder for (omit for default account)"),
+  },
+  withErrorHandling(({ limit = 20, daysAgo = 2, account }) => {
+    const items = mailManager.getWaitingFor(limit, daysAgo, account);
+
+    if (items.length === 0) {
+      return successResponse(
+        `No waiting-for items found. All sent messages in the last ${limit} (sent ${daysAgo}+ days ago) have received replies.`
+      );
+    }
+
+    const lines: string[] = [
+      `Waiting-for list: ${items.length} sent message(s) with no reply`,
+      "Sorted oldest first (most overdue at top)",
+      "═══════════════════════════════════════════",
+      "",
+    ];
+
+    items.forEach((item, i) => {
+      lines.push(`[${i + 1}] ID: ${item.id}`);
+      lines.push(`  Subject: ${item.subject}`);
+      lines.push(`  To: ${item.recipients.join(", ")}`);
+      lines.push(`  Sent: ${item.dateSent.toISOString().slice(0, 10)}`);
+      lines.push(`  Days waiting: ${item.daysWaiting}`);
+      lines.push("");
+    });
+
+    return successResponse(lines.join("\n"));
+  }, "Error detecting waiting-for items")
+);
+
+// =============================================================================
 // Server Startup
 // =============================================================================
 
